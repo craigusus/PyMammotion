@@ -154,6 +154,7 @@ class BLETransport(Transport):
             self._client = None
             self._message = None
             await self._notify_availability(TransportAvailability.DISCONNECTED)
+            await asyncio.sleep(10.0)
             raise BLEUnavailableError(
                 f"BLE start_notify failed for {self._config.device_id!r} — reset for fresh retry: {exc}"
             ) from exc
