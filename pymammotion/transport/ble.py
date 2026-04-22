@@ -139,7 +139,25 @@ class BLETransport(Transport):
 
         self._message = BleMessage(self._client)
 
-        await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
+        try:
+            await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
+        except BleakError as exc:
+            _logger.warning(
+                "BLETransport: start_notify failed for %s (stale GATT handle — forcing disconnect): %s",
+                self._config.device_id,
+                exc,
+            )
+            try:
+                await self._client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
+            self._message = None
+            await self._notify_availability(TransportAvailability.DISCONNECTED)
+            raise BLEUnavailableError(
+                f"BLE start_notify failed for {self._config.device_id!r} — reset for fresh retry: {exc}"
+            ) from exc
+
         await self._notify_availability(TransportAvailability.CONNECTED)
         _logger.debug("BLETransport connected to %s", self._config.device_id)
 
