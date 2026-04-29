@@ -334,11 +334,7 @@ class DeviceHandle:
             _logger.info("Failed to parse incoming bytes as LubaMsg (%d bytes)", len(payload))
             return
 
-        if _logger.isEnabledFor(logging.DEBUG):
-            try:
-                _logger.debug("← %s  %s", self.device_name, luba_msg.to_dict(include_default_values=False))
-            except Exception as exc:
-                _logger.debug("← %s  <serialisation error: %s>", self.device_name, exc)
+        _logger.debug("← %s  %s", self.device_name, luba_msg.to_dict(include_default_values=False))
 
         if self._availability.mqtt_reported_offline and transport_type != TransportType.BLE:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)

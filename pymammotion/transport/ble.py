@@ -8,8 +8,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from bleak.exc import BleakError
-from bleak import BleakClient
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 from pymammotion.bluetooth.ble_message import BleMessage
 from pymammotion.bluetooth.const import UUID_NOTIFICATION_CHARACTERISTIC
@@ -63,7 +62,7 @@ class BLETransport(Transport):
         super().__init__()
         self._config = config
         self._ble_device: BLEDevice | None = None
-        self._client: BleakClient | None = None
+        self._client: BleakClientWithServiceCache | None = None
         self._message: BleMessage | None = None
         self._availability: TransportAvailability = TransportAvailability.DISCONNECTED
         self._disconnect_on_idle: bool = True
@@ -131,7 +130,7 @@ class BLETransport(Transport):
 
         try:
             self._client = await establish_connection(
-                BleakClient,
+                BleakClientWithServiceCache,
                 self._ble_device,
                 self._config.device_id,
                 self._handle_disconnect,
@@ -144,26 +143,7 @@ class BLETransport(Transport):
 
         self._message = BleMessage(self._client)
 
-        try:
-            await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
-        except BleakError as exc:
-            _logger.warning(
-                "BLETransport: start_notify failed for %s (stale GATT handle — forcing disconnect): %s",
-                self._config.device_id,
-                exc,
-            )
-            try:
-                await self._client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            self._client = None
-            self._message = None
-            await self._notify_availability(TransportAvailability.DISCONNECTED)
-            await asyncio.sleep(10.0)
-            raise BLEUnavailableError(
-                f"BLE start_notify failed for {self._config.device_id!r} — reset for fresh retry: {exc}"
-            ) from exc
-
+        await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
         await self._notify_availability(TransportAvailability.CONNECTED)
         _logger.debug("BLETransport connected to %s", self._config.device_id)
 
