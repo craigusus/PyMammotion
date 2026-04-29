@@ -7,11 +7,8 @@ import pyjoystick
 from pyjoystick.sdl2 import Key, run_event_loop
 from pyjoystick.utils import PeriodicThread
 
-from pymammotion.event import BleNotificationEvent
-from pymammotion.mammotion.devices import MammotionBaseBLEDevice
+from pymammotion.device.handle import DeviceHandle
 from pymammotion.utility.movement import get_percent, transform_both_speeds
-
-bleNotificationEvt = BleNotificationEvent()
 
 _logger = logging.getLogger(__name__)
 
@@ -21,15 +18,15 @@ nest_asyncio.apply()
 class JoystickControl:
     """Joystick class for controlling Luba with a joystick"""
 
-    angular_percent = 0
-    linear_percent = 0
-    linear_speed = 0
-    angular_speed = 0
+    angular_percent: float = 0
+    linear_percent: float = 0
+    linear_speed: float = 0
+    angular_speed: float = 0
     ignore_events = False
     _blade_height = 25
     worker = None
 
-    def __init__(self, luba_ble: MammotionBaseBLEDevice) -> None:
+    def __init__(self, luba_ble: DeviceHandle) -> None:
         self._client = luba_ble
         self._curr_time = timer()
         self.stopped = False
@@ -64,7 +61,11 @@ class JoystickControl:
             self.linear_percent,
             self.angular_percent,
         )
-        asyncio.run(self._client.command("send_movement", linear_speed=linear_speed, angular_speed=angular_speed))
+        asyncio.run(
+            self._client.send_raw(
+                self._client.commands.send_movement(linear_speed=linear_speed, angular_speed=angular_speed)
+            )
+        )
 
     def print_add(self, joy) -> None:
         """Log that a joystick device has been connected."""
@@ -90,23 +91,27 @@ class JoystickControl:
         if key.keytype is Key.BUTTON and key.value == 1:
             # print(key, "-", key.keytype, "-", key.number, "-", key.value)
             if key.number == 0:  # x
-                asyncio.run(self._client.command("return_to_dock"))
+                asyncio.run(self._client.send_raw(self._client.commands.return_to_dock()))
             if key.number == 1:
-                asyncio.run(self._client.command("leave_dock"))
+                asyncio.run(self._client.send_raw(self._client.commands.leave_dock()))
             if key.number == 3:
-                asyncio.run(self._client.command("set_blade_control", on_off=1))
+                asyncio.run(self._client.send_raw(self._client.commands.set_blade_control(on_off=1)))
             if key.number == 2:
-                asyncio.run(self._client.command("set_blade_control", on_off=0))
+                asyncio.run(self._client.send_raw(self._client.commands.set_blade_control(on_off=0)))
             if key.number == 9:
                 # lower knife height
                 if self._blade_height > 25:
                     self._blade_height -= 5
-                    asyncio.run(self._client.command("set_blade_height", height=self._blade_height))
+                    asyncio.run(
+                        self._client.send_raw(self._client.commands.set_blade_height(height=self._blade_height))
+                    )
             if key.number == 10:
                 # raise knife height
                 if self._blade_height < 60:
                     self._blade_height += 5
-                    asyncio.run(self._client.command("set_blade_height", height=self._blade_height))
+                    asyncio.run(
+                        self._client.send_raw(self._client.commands.set_blade_height(height=self._blade_height))
+                    )
 
         if key.keytype is Key.AXIS:
             # print(key, "-", key.keytype, "-", key.number, "-", key.value)
