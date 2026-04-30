@@ -47,6 +47,7 @@ from pymammotion.proto import RptAct, RptInfoType
 from pymammotion.transport.aliyun_mqtt import AliyunMQTTConfig, AliyunMQTTTransport
 from pymammotion.transport.base import (
     AuthError,
+    BLEUnavailableError,
     LoginFailedError,
     NoTransportAvailableError,
     ReLoginRequiredError,
@@ -669,6 +670,8 @@ class MammotionClient:
         device_name: str,
         ble_device: BLEDevice,
         initial_device: MowingDevice,
+        *,
+        disconnect_on_idle: bool = True,
     ) -> DeviceHandle:
         """Register a BLE-only device — no HTTP login or MQTT involved.
 
@@ -677,10 +680,12 @@ class MammotionClient:
         then ``transport.connect()`` to open the GATT connection.
 
         Args:
-            device_id:      Unique device identifier (e.g. ``"Luba-XXXXXX"``).
-            device_name:    Human-readable name shown in HA.
-            ble_device:     The bleak ``BLEDevice`` obtained from a BLE scan.
-            initial_device: An empty or cached ``MowingDevice`` for initial state.
+            device_id:          Unique device identifier (e.g. ``"Luba-XXXXXX"``).
+            device_name:        Human-readable name shown in HA.
+            ble_device:         The bleak ``BLEDevice`` obtained from a BLE scan.
+            initial_device:     An empty or cached ``MowingDevice`` for initial state.
+            disconnect_on_idle: When False, keep the BLE connection alive between
+                                commands (stay-connected mode).
 
         Returns:
             The registered ``DeviceHandle``.
@@ -688,6 +693,7 @@ class MammotionClient:
         """
         transport = BLETransport(BLETransportConfig(device_id=device_id))
         transport.set_ble_device(ble_device)
+        transport.set_disconnect_strategy(disconnect=disconnect_on_idle)
 
         handle = DeviceHandle(
             device_id=device_id,
@@ -1821,19 +1827,21 @@ class MammotionClient:
                         lambda: handle.send_raw(command_bytes, prefer_ble=_prefer_ble),
                         _session,
                     )
-                except NoTransportAvailableError:
+                except (NoTransportAvailableError, BLEUnavailableError) as exc:
                     if _attempt >= _no_transport_max:
                         _logger.warning(
-                            "send_command_with_args '%s': no transport after %d attempts — dropping",
+                            "send_command_with_args '%s': transport unavailable after %d attempts (%s) — dropping",
                             name,
                             _attempt,
+                            exc,
                         )
                         return
                     _logger.debug(
-                        "send_command_with_args '%s': no transport (attempt %d/%d) — retrying in %.1fs",
+                        "send_command_with_args '%s': transport unavailable (attempt %d/%d, %s) — retrying in %.1fs",
                         name,
                         _attempt,
                         _no_transport_max,
+                        exc,
                         _no_transport_delay,
                     )
                     await asyncio.sleep(_no_transport_delay)
