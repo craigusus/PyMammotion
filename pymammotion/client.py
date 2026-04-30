@@ -709,6 +709,7 @@ class MammotionClient:
             ble_session = AccountSession(account_id=BLE_ONLY_ACCOUNT)
             await self._account_registry.register(ble_session)
         ble_session.device_ids.add(device_name)
+        await handle.start()
         _logger.info("BLE-only device registered: %s (%s)", device_name, device_id)
         return handle
 
