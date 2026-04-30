@@ -170,12 +170,10 @@ class BLETransport(Transport):
         transport as DISCONNECTED so the registry routes future traffic to
         the fallback transport.
         """
-        if self._client is None or self._message is None:
-            msg = "BLETransport has no client; cannot send payload"
-            raise TransportError(msg)
-        _logger.debug("BLETransport send: %d bytes to %s", len(payload), self._config.device_id)
-        if not self._client.is_connected:
+        if self._client is None or self._message is None or not self._client.is_connected:
+            _logger.debug("BLETransport send: reconnecting %s before send", self._config.device_id)
             await self.connect()
+        _logger.debug("BLETransport send: %d bytes to %s", len(payload), self._config.device_id)
         try:
             async with self._operation_lock:
                 await self._message.post_custom_data_bytes(payload)
