@@ -41,6 +41,8 @@ dependencies = [
 extras = [
     "pyjoystick>=1.2.4,<2",
     "nest-asyncio>=1.6.0,<2",
+    "aioesphomeapi>=44.23.0",
+    "bleak-esphome>=3.7.3",
 ]
 dev = [
     "types-protobuf>=6.32.1.20250918,<7",
