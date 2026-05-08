@@ -887,10 +887,6 @@ class DeviceHandle:
         * The stop callback skips RPT_STOP if BLE is still streaming so the BLE
           polling loop is never interrupted mid-run.
         """
-        if self._device_mode() != _DeviceMode.ACTIVE:
-            await self.request_report_snapshot()
-            return
-
         already_streaming = self._report_stream_timer is not None
 
         if self._report_stream_timer is not None:
