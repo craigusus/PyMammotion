@@ -497,6 +497,7 @@ class DeviceHandle:
 
         async def _do_send(cmd: bytes, field: str) -> None:
             self._last_user_command_monotonic = time.monotonic()
+            self._rearm_event.set()  # wake BLE polling loop so mode change is detected promptly
             _logger.debug(
                 "_do_send '%s': field=%s transports=%s",
                 self.device_name,
