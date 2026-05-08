@@ -339,10 +339,10 @@ class DeviceHandle:
                 f"Transport {transport.transport_type.value} is rate-limited — send blocked"
             )
 
-        if (
-            transport.transport_type in self._last_send_monotonic
-            and time.monotonic() - self._last_send_monotonic[transport.transport_type] > 300
-        ):
+        last = self._last_send_monotonic.get(transport.transport_type)
+        if last is not None and time.monotonic() - last > 300:
+            # No commands sent for 5 minutes — prepend a BLE sync so the
+            # device knows we are still connected before the real payload.
             sync = self.commands.send_todev_ble_sync(sync_type=3)
             await transport.send(sync, iot_id=self.iot_id)
 
@@ -928,10 +928,7 @@ class DeviceHandle:
             count=0,
         )
 
-        async def _send() -> None:
-            await self.send_raw(cmd_bytes)
-
-        await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
+        await self.send_raw(cmd_bytes)
 
     async def _send_report_stream_keep(self) -> None:
         """Enqueue RPT_KEEP to refresh an already-active continuous stream."""
@@ -991,6 +988,7 @@ class DeviceHandle:
             timeout=timeout,
             count=count,
         )
+        await self.send_raw(cmd_bytes)
 
     async def _enqueue_ble_stream_command(self, act: RptAct, count: int) -> None:
         """Enqueue a BLE-pinned ``request_iot_sys`` config command.
@@ -1078,7 +1076,7 @@ class DeviceHandle:
         if t is not None and t.is_connected:
             await t.disconnect()
 
-    async def send_raw(self, payload: bytes, *, prefer_ble: bool = False) -> None:
+    async def send_raw(self, payload: bytes, *, prefer_ble: bool | None = None) -> None:
         """Send raw bytes via the best available transport, with BLE fallback on offline."""
         _logger.debug(
             "send_raw '%s': %d bytes prefer_ble=%s transports=%s",
@@ -1087,7 +1085,8 @@ class DeviceHandle:
             prefer_ble,
             {k.value: v.is_connected for k, v in self._transports.items()},
         )
-        use_ble = prefer_ble or self._prefer_ble
+
+        use_ble = self.prefer_ble if prefer_ble is None else prefer_ble
         if use_ble:
             ble = self._transports.get(TransportType.BLE)
             if ble is not None and not ble.is_connected:
@@ -1123,10 +1122,7 @@ class DeviceHandle:
             ble = self._transports.get(TransportType.BLE)
             if ble is not None and not ble.is_connected and ble.is_usable:
                 _logger.debug("BLE disconnected for '%s' — reconnecting before send", self.device_name)
-                try:
-                    await ble.connect()
-                except BLEUnavailableError:
-                    raise  # genuinely no transport — caller has nothing to fall back to
+                await ble.connect()
                 transport = self.active_transport(prefer_ble=prefer_ble)
             else:
                 raise
