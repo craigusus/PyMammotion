@@ -300,8 +300,9 @@ class MowerStateManager:
                 self._device.run_state_update(sys_msg[1])
             case "todev_time_ctrl_light":
                 ctrl_light: TimeCtrlLight = sys_msg[1]
-                side_led: SideLight = SideLight.from_dict(ctrl_light.to_dict(casing=betterproto2.Casing.SNAKE))
-                self._device.mower_state.side_led = side_led
+                if ctrl_light.operate == 1:
+                    side_led: SideLight = SideLight.from_dict(ctrl_light.to_dict(casing=betterproto2.Casing.SNAKE))
+                    self._device.mower_state.side_led = side_led
             case "device_product_type_info":
                 device_product_type: DeviceProductTypeInfoT = sys_msg[1]
                 if device_product_type.main_product_type != "" or device_product_type.sub_product_type != "":
