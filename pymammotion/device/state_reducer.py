@@ -445,12 +445,9 @@ class MowerStateReducer(StateReducer):
                     ctrl_light.start_hour, ctrl_light.start_min,
                     ctrl_light.end_hour, ctrl_light.end_min,
                 )
-                # operate=1 is the device's read response — trust it.
-                # operate=0 is our own outbound set command echoed back — ignore
-                # it so the dummy enable=0 in read queries doesn't corrupt state.
-                if ctrl_light.operate == 1:
-                    side_led: SideLight = SideLight.from_dict(ctrl_light.to_dict(casing=betterproto2.Casing.SNAKE))
-                    device.mower_state.side_led = side_led
+                # Device always responds with operate=0. Update state unconditionally.
+                side_led: SideLight = SideLight.from_dict(ctrl_light.to_dict(casing=betterproto2.Casing.SNAKE))
+                device.mower_state.side_led = side_led
             case "toapp_lora_cfg_rsp":
                 lora_cfg: LoraCfgRsp = sys_msg[1]
                 device.mower_state.lora_config = lora_cfg.cfg
