@@ -1599,6 +1599,7 @@ class MammotionClient:
                     _logger.debug(f"Restoring root_hash_lists for {device.map} from saga result")
                     _logger.debug(f"Restoring root_hash_lists for {saga.result} from saga result")
                     device.map.root_hash_lists = saga.result.root_hash_lists
+                device.map.update_hash_lists(device.map.hashlist)
                 if device.location.RTK.latitude != 0:
                     device.map.generate_geojson(device.location.RTK, device.location.dock)
                 # Notify map_updated subscribers after a successful saga, matching
@@ -2064,6 +2065,7 @@ class MammotionClient:
         expected_field: str,
         *,
         send_timeout: float = 5.0,
+        prefer_ble: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Send a command and wait for the matching protobuf response.
@@ -2081,6 +2083,7 @@ class MammotionClient:
         Raises:
             KeyError:             if *name* is not a registered device.
             CommandTimeoutError:  if no response after retries.
+            :param prefer_ble:
 
         """
         handle = self._device_registry.get_by_name(name)
@@ -2094,7 +2097,7 @@ class MammotionClient:
 
         async def _send() -> None:
             await self._send_with_auth_retry(
-                lambda: handle.send_raw(payload=command_bytes),
+                lambda: handle.send_raw(payload=command_bytes, prefer_ble=prefer_ble),
                 _session,
             )
 
