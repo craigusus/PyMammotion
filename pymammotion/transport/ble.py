@@ -160,7 +160,7 @@ class BLETransport(Transport):
         """
         if self._ble_device is None:
             return False
-        return time.monotonic() >= self._connect_cooldown_until
+        return super().is_usable and time.monotonic() >= self._connect_cooldown_until
 
     # ------------------------------------------------------------------
     # Transport ABC
@@ -251,7 +251,7 @@ class BLETransport(Transport):
                     self._ble_device,
                     self._config.device_id,
                     self._handle_disconnect,
-                    max_attempts=2,
+                    max_attempts=1,
                     ble_device_callback=lambda: self._ble_device,  # type: ignore[arg-type,return-value]
                 )
             except BleakError as exc:
@@ -357,6 +357,7 @@ class BLETransport(Transport):
             await self._client.disconnect()
         self._client = None
         self._message = None
+        self.clear_ble_device()
         await self._notify_availability(TransportAvailability.DISCONNECTED)
 
     async def _write_payload(self, payload: bytes) -> None:
