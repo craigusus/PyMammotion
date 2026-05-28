@@ -537,6 +537,21 @@ class HashList(DataClassORJSONMixin):
 
         return area_name_list
 
+    def upsert_area_name(self, hash_id: int, name: str) -> None:
+        """Set (or insert) the display name for a single area hash.
+
+        Used by the ``toapp_map_name_msg`` reducer path: when the app renames an
+        area the device acks with one ``NavMapNameMsg`` (hash + new name) rather
+        than re-sending the whole ``toapp_all_hash_name`` list, so we patch the
+        matching ``area_name`` entry in place, appending one if the hash is not
+        yet tracked.
+        """
+        for entry in self.area_name:
+            if entry.hash == hash_id:
+                entry.name = name
+                return
+        self.area_name.append(AreaHashNameList(name=name, hash=hash_id))
+
     def missing_hashlist(self, sub_cmd: int = 0) -> list[int]:
         """Return hash IDs declared in ``root_hash_lists`` for *sub_cmd* but not yet fetched."""
         all_hash_ids = set(self.area.keys()).union(
@@ -760,6 +775,13 @@ class HashList(DataClassORJSONMixin):
                 self.dynamics_line = []
             self.dynamics_line.extend(hash_data.data_couple)
             return True
+
+        # NavGetCommData with type=SVG carries no geometry — real SVG geometry only
+        # arrives as SvgMessage (toapp_svg_msg).  Discard rather than storing it as a
+        # geometry-less unknown-type frame (which would also mark the hash "received"
+        # via find_incomplete_hashes and skip fetching its real data).
+        if hash_data.type == PathType.SVG:
+            return False
 
         path_type_mapping = self._get_path_type_mapping()
         target_dict = path_type_mapping.get(hash_data.type)
