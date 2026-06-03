@@ -411,6 +411,15 @@ class DeviceHandle:
         """Propagate critical errors to the error bus."""
         await self._error_bus.emit(error)
 
+    async def notify_critical_error(self, error: Exception) -> None:
+        """Publicly emit a critical error to subscribers of this device's error bus.
+
+        Used by :class:`MammotionClient` to tell exactly the mowers on a permanently
+        failed transport (e.g. Mammotion MQTT auth gave up) that they need re-auth,
+        so the host can mark just those devices unavailable.
+        """
+        await self._on_critical_error(error)
+
     async def add_transport(self, transport: Transport) -> None:
         """Register a transport (MQTT or BLE).  Replaces any existing transport of the same type.
 
@@ -497,8 +506,18 @@ class DeviceHandle:
         if changed and not self._stopping:
             await self._state_changed_bus.emit(snapshot)
 
-        # 6. Emit map_updated when the device sends a fresh area-name list.
-        if luba_msg.nav is not None and luba_msg.nav.toapp_all_hash_name is not None:
+        # 6. Emit map_updated when the area set HA renders changes:
+        #   - toapp_all_hash_name: wholesale area-name list (post-2025 / non-Luba1).
+        #   - toapp_map_name_msg: single-area rename ack (hash != 0; hash == 0 is
+        #     the get-list request shape, not a rename).
+        # Area geometry (toapp_get_commondata_ack) is deliberately NOT a trigger: it
+        # arrives per-frame in bulk during a MapFetchSaga, and the saga's on_complete
+        # already emits map_updated once at the end — so firing per frame would just
+        # churn map-derived UI mid-fetch.
+        nav = luba_msg.nav
+        if nav is not None and (
+            nav.toapp_all_hash_name is not None or (nav.toapp_map_name_msg is not None and nav.toapp_map_name_msg.hash)
+        ):
             await self._map_updated_bus.emit(None)
 
         # 7. Emit shutdown when the device notifies it is about to power off.
@@ -1348,7 +1367,7 @@ class DeviceHandle:
         if t is not None and t.is_connected:
             await t.disconnect()
 
-    async def wait_until_connected(self, *, timeout: float = 30.0, mqtt_stable_for: float = 10.0) -> bool:
+    async def wait_until_connected(self, *, timeout: float = 15.0, mqtt_stable_for: float = 2.0) -> bool:
         """Block until a transport is ready to carry commands, or *timeout* elapses.
 
         Readiness mirrors how the transports actually behave at startup:
@@ -1380,7 +1399,7 @@ class DeviceHandle:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         mqtt_connected_since: float | None = None
-        poll_interval = 0.25
+        poll_interval = 0.5
 
         while True:
             now = loop.time()

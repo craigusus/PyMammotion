@@ -356,6 +356,25 @@ class MowerStateReducer(StateReducer):
                 device.map.update(SvgMessage.from_dict(common_svg_data.to_dict(casing=betterproto2.Casing.SNAKE)))
             case "toapp_all_hash_name":
                 hash_names: AppGetAllAreaHashName = nav_msg[1]  # type: ignore
+                # The area name list reflects the device's CURRENT areas.  When the
+                # device's reported bol_hash no longer matches our stored root
+                # manifest, the map was edited device-side — an edited area gets a new
+                # content hash that isn't in our (pre-edit) root_hash_lists.  Reconcile
+                # against bol_hash and wipe the stale manifest, otherwise the per-frame
+                # prune in HashList.update drops the edited area's freshly-arriving
+                # geometry (its hash isn't in the stale manifest) — removing the area
+                # instead of replacing it.  An empty manifest makes update_hash_lists a
+                # no-op, so the geometry survives until the map saga re-fetches it.
+                #
+                # Only do this OUTSIDE a saga: during a MapFetchSaga the saga owns
+                # root_hash_lists freshness (it always re-fetches it), and the device
+                # may push toapp_all_hash_name mid-fetch.  Wiping the manifest then
+                # would empty find_incomplete_hashes and stop step 4 early, leaving
+                # area geometry unfetched.  The saga handles staleness at its start.
+                if not self._is_saga_active():
+                    bol_hash = device.report_data.locations[0].bol_hash if device.report_data.locations else 0
+                    if bol_hash:
+                        device.map.invalidate_maps(bol_hash)
                 if hash_names.hashnames:
                     device.map.area_name = [
                         AreaHashNameList(name=item.name, hash=item.hash) for item in hash_names.hashnames
@@ -782,32 +801,34 @@ class MowerStateReducer(StateReducer):
                 _apply_mower_fw_module(device.device_firmwares, fw_type, v)
 
         try:
-            if p.device_version_info.dev_ver:
-                device.device_firmwares.device_version = p.device_version_info.dev_ver
-            for module in p.device_version_info.fw_info:
-                if module.v:
-                    _apply_mower_fw_module(device.device_firmwares, module.t, module.v)
+            if device_version_info := p.device_version_info:
+                if device_version_info.dev_ver:
+                    device.device_firmwares.device_version = device_version_info.dev_ver
+                for module in device_version_info.fw_info:
+                    if module.v:
+                        _apply_mower_fw_module(device.device_firmwares, module.t, module.v)
         except (AttributeError, TypeError):
             _logger.debug("MowerStateReducer: failed to apply deviceVersionInfo (mammotion)")
 
-            if p.coordinate.lat != 0 and p.coordinate:
-                device.location.device.latitude = p.coordinate.lat
-            if p.coordinate.lon != 0 and p.coordinate:
-                device.location.device.longitude = p.coordinate.lon
+        if coordinate := p.coordinate:
+            if coordinate.lat != 0:
+                device.location.device.latitude = coordinate.lat
+            if coordinate.lon != 0:
+                device.location.device.longitude = coordinate.lon
 
         try:
-            net = p.network_info
-            device.mower_state.wifi_mac = net.wifi_sta_mac or device.mower_state.wifi_mac
-            device.mower_state.ble_mac = net.bt_mac or device.mower_state.ble_mac
-            device.mower_state.wifi_ssid = net.ssid or device.mower_state.wifi_ssid
-            device.mower_state.ip_address = net.ip or device.mower_state.ip_address
-            device.report_data.connect.wifi_rssi = net.wifi_rssi
-            if net.mileage:
-                device.report_data.dev.mileage = int(net.mileage)
-            if net.wt_sec is not None:
-                device.report_data.dev.work_time_sec = int(net.wt_sec)
-            if net.bat_cycles:
-                device.report_data.maintenance.bat_cycles = int(net.bat_cycles)
+            if net := p.network_info:
+                device.mower_state.wifi_mac = net.wifi_sta_mac or device.mower_state.wifi_mac
+                device.mower_state.ble_mac = net.bt_mac or device.mower_state.ble_mac
+                device.mower_state.wifi_ssid = net.ssid or device.mower_state.wifi_ssid
+                device.mower_state.ip_address = net.ip or device.mower_state.ip_address
+                device.report_data.connect.wifi_rssi = net.wifi_rssi
+                if net.mileage:
+                    device.report_data.dev.mileage = int(net.mileage)
+                if net.wt_sec is not None:
+                    device.report_data.dev.work_time_sec = int(net.wt_sec)
+                if net.bat_cycles:
+                    device.report_data.maintenance.bat_cycles = int(net.bat_cycles)
         except (AttributeError, ValueError, TypeError):
             _logger.debug("MowerStateReducer: failed to apply networkInfo (mammotion)")
 
