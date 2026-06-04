@@ -1357,6 +1357,11 @@ class MammotionClient:
                 _logger.info("Aliyun IoT token refreshed after full re-login")
                 return True
             except Exception as exc:
+                if is_transient_network_error(exc):
+                    # DNS / network down — not an auth failure.  Re-raise the original
+                    # network error so the MQTT transport's reconnect backoff handles it
+                    # rather than treating the outage as an unrecoverable credential problem.
+                    raise
                 _logger.exception("Full re-login failed after Aliyun bind token expiry")
                 raise ReLoginRequiredError(
                     acct_session.email if acct_session else "",
@@ -1400,6 +1405,17 @@ class MammotionClient:
                 asyncio.get_running_loop().call_soon(lambda: asyncio.ensure_future(transport.connect()))
                 _logger.info("Aliyun transport reconnect scheduled after final re-login")
             except Exception as relogin_exc:
+                if is_transient_network_error(relogin_exc):
+                    # DNS / network down during the final re-login attempt.  The credentials
+                    # may still be valid — schedule a reconnect and let the backoff loop
+                    # retry rather than marking the transport unrecoverable.
+                    _logger.warning(
+                        "Aliyun final re-login skipped (network unavailable) — will retry on reconnect: %s",
+                        relogin_exc,
+                    )
+                    transport.clear_auth_failed()
+                    asyncio.get_running_loop().call_soon(lambda: asyncio.ensure_future(transport.connect()))
+                    return
                 _logger.exception("Final re-login failed for Aliyun transport — user must re-authenticate")
                 await self._signal_transport_unrecoverable(acct_session, TransportType.CLOUD_ALIYUN, relogin_exc)
 

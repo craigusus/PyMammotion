@@ -37,6 +37,7 @@ from pymammotion.transport.base import (
     TransportError,
     TransportRateLimitedError,
     TransportType,
+    is_transient_network_error,
 )
 
 if TYPE_CHECKING:
@@ -472,7 +473,11 @@ class AliyunMQTTTransport(Transport):
                     except ReLoginRequiredError as relogin_exc:
                         await self._handle_fatal_auth_error(relogin_exc)
                         raise
-                    except Exception:
+                    except Exception as auth_exc:
+                        if is_transient_network_error(auth_exc):
+                            # Network was down during the credential refresh — not an auth failure.
+                            # Re-raise as OSError so the outer except OSError handler backs off.
+                            raise OSError(str(auth_exc)) from auth_exc
                         _logger.warning("on_auth_failure callback failed", exc_info=True)
                 fatal = ReLoginRequiredError("", f"Aliyun bind token unrecoverable: {exc}")
                 await self._handle_fatal_auth_error(fatal)
