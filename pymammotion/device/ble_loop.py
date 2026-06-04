@@ -234,7 +234,7 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
             was_continuous = ble_interval is None
 
             try:
-                await handle._sleep_or_rearm(wait)  # noqa: SLF001
+                await asyncio.sleep(wait)
             except asyncio.CancelledError:
                 break
     finally:
