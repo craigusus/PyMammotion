@@ -509,13 +509,6 @@ class MowerStateReducer(StateReducer):
                         device.mower_state.animal_protection.status = comm_cmd.context
             case "todev_time_ctrl_light":
                 ctrl_light: TimeCtrlLight = sys_msg[1]  # type: ignore
-                _logger.debug(
-                    "side_led update: operate=%s enable=%s action=%s start=%s:%s end=%s:%s",
-                    ctrl_light.operate, ctrl_light.enable, ctrl_light.action,
-                    ctrl_light.start_hour, ctrl_light.start_min,
-                    ctrl_light.end_hour, ctrl_light.end_min,
-                )
-                # Device always responds with operate=0. Update state unconditionally.
                 side_led: SideLight = SideLight.from_dict(ctrl_light.to_dict(casing=betterproto2.Casing.SNAKE))
                 device.mower_state.side_led = side_led
             case "toapp_lora_cfg_rsp":
@@ -642,11 +635,6 @@ class MowerStateReducer(StateReducer):
                 device.mower_state.audio.sex = cfg_msg.sex.value
             case "get_lamp_rsp":
                 lamp_resp: Getlamprsp = mul_msg[1]  # type: ignore
-                _logger.debug(
-                    "get_lamp_rsp: get_ids=%s lamp_bright=%s lamp_ctrl=%s lamp_manual_ctrl=%s",
-                    lamp_resp.get_ids, lamp_resp.lamp_bright,
-                    lamp_resp.lamp_ctrl, lamp_resp.lamp_manual_ctrl,
-                )
                 device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright
                 if lamp_resp.get_ids in (1126, 1127):
                     device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright

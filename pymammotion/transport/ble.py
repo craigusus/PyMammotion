@@ -416,6 +416,7 @@ class BLETransport(Transport):
         of clearing.  ``connect()`` uses a separate ``_connect_lock`` so this
         nested call doesn't self-deadlock.
         """
+        _logger.debug("BLETransport send: %d bytes to %s", len(payload), self._config.device_id)
         async with self._operation_lock:
             if self._client is None or not self._client.is_connected:
                 await self.connect()

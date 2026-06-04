@@ -131,10 +131,9 @@ class MessageSystem(AbstractMessage, ABC):
     def read_and_set_sidelight(self, is_sidelight: bool, operate: int) -> bytes:
         """Read or set the side LED.
 
-        Device uses inverted enable logic (confirmed from device logs):
         is_sidelight=True  → enable=0 (light on)
         is_sidelight=False → enable=1 (light off)
-        operate=0 → write/read (device always responds with operate=0).
+        operate=0 → write (set), operate=1 → read (query current state).
         """
         build = TimeCtrlLight(
             operate=operate,

@@ -1176,7 +1176,6 @@ class DeviceHandle:
             await self.request_report_snapshot()
             return
 
-
         already_streaming = self._report_stream_timer is not None
 
         if self._report_stream_timer is not None:
