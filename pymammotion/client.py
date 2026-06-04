@@ -1714,7 +1714,24 @@ class MammotionClient:
                 # Force-refresh the restored Aliyun session before the device-list call:
                 # the cached iotToken may be server-side rejected even if our local expiry
                 # clock says it is still valid (e.g. a prior session invalidated it).
-                await cloud_client.check_or_refresh_session(force=True)
+                try:
+                    await cloud_client.check_or_refresh_session(force=True)
+                except SessionExpiredError:
+                    # The cached Aliyun refreshToken is genuinely expired — escalate to a
+                    # full IoT re-login using the stored HTTP credentials rather than just
+                    # skipping discovery.  This re-runs the full Aliyun IoT login sequence
+                    # (connect, login_by_oauth, aep_handle, session_by_auth_code) so the
+                    # new iotToken and refreshToken are stored in cloud_client before the
+                    # list_binding_by_account call below.
+                    _logger.warning(
+                        "restore_credentials: Aliyun refreshToken expired for account %s — "
+                        "escalating to full IoT re-login",
+                        account,
+                    )
+                    await TokenManager.connect_iot(cloud_client)
+                    if acct_session.token_manager is not None:
+                        await acct_session.token_manager.refresh_aliyun_credentials()
+
                 session_data = (
                     cloud_client.session_by_authcode_response.data
                     if cloud_client.session_by_authcode_response is not None
