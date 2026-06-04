@@ -12,7 +12,7 @@ import logging
 from pymammotion.bluetooth.ble import MammotionBLE
 from pymammotion.http.http import MammotionHTTP
 
-__version__ = "0.8.7"
+__version__ = "0.8.8"
 
 logger = logging.getLogger(__name__)
 
