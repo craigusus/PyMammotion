@@ -395,14 +395,17 @@ class MQTTTransport(Transport):
     async def _run(self) -> None:
         """Run the main connection loop.
 
-        Auth recovery is deliberately minimal: on a broker auth rejection we force
-        ONE full credential refresh (refresh-token based — never ``login_v2``) and
-        retry; if the broker still rejects, we give up (``_give_up`` marks this
-        transport unrecoverable and signals the affected mowers).  Non-auth
-        disconnects reconnect with exponential backoff as usual.
+        Auth recovery: on a broker auth rejection we force ONE full credential
+        refresh and retry immediately.  If the broker still rejects after the
+        refresh, we back off (same as a non-auth disconnect) and retry — the
+        broker may transiently reject a freshly-minted token while propagating
+        the rotation.  We only give up permanently after
+        _AUTH_CONSECUTIVE_GIVE_UP consecutive auth rejections.
         """
         backoff = _MQTT_RECONNECT_MIN_SEC
         auth_force_refreshed = False
+        auth_consecutive_failures = 0
+        _AUTH_CONSECUTIVE_GIVE_UP = 5
 
         while not self._stop_event.is_set():
             await self._notify_availability(TransportAvailability.CONNECTING)
@@ -435,6 +438,7 @@ class MQTTTransport(Transport):
                     self._client = client
                     backoff = _MQTT_RECONNECT_MIN_SEC
                     auth_force_refreshed = False
+                    auth_consecutive_failures = 0
                     await self._notify_availability(TransportAvailability.CONNECTED)
 
                     for topic in self._topics:
@@ -478,19 +482,37 @@ class MQTTTransport(Transport):
                             continue
                     else:
                         # Already force-refreshed this cycle and the broker still
-                        # rejects — the credentials are genuinely bad; give up.
-                        _logger.error(
-                            "MQTT auth still rejected after full credential refresh (rc=%s) — giving up on %s [%s]",
+                        # rejects.  The broker may transiently reject a freshly-minted
+                        # token during propagation — back off and retry rather than
+                        # giving up immediately.  Only give up after several consecutive
+                        # failures so a brief broker hiccup doesn't permanently disable
+                        # the transport.
+                        auth_consecutive_failures += 1
+                        auth_force_refreshed = False  # force-refresh again next attempt
+                        if auth_consecutive_failures >= _AUTH_CONSECUTIVE_GIVE_UP:
+                            _logger.error(
+                                "MQTT auth still rejected after %d consecutive refreshes (rc=%s) — "
+                                "giving up on %s [%s]",
+                                auth_consecutive_failures,
+                                rc,
+                                self.transport_type.value,
+                                _broker_identity_summary(self._config),
+                            )
+                            auth_exc = ReLoginRequiredError(
+                                self._token_manager.account_id,
+                                f"MQTT auth rejected after full credential refresh (rc={rc})",
+                            )
+                            await self._give_up(auth_exc)
+                            return
+                        _logger.warning(
+                            "MQTT auth still rejected after force-refresh (rc=%s, attempt %d/%d) — "
+                            "backing off %ds before retry [%s]",
                             rc,
-                            self.transport_type.value,
+                            auth_consecutive_failures,
+                            _AUTH_CONSECUTIVE_GIVE_UP,
+                            backoff,
                             _broker_identity_summary(self._config),
                         )
-                        auth_exc = ReLoginRequiredError(
-                            self._token_manager.account_id,
-                            f"MQTT auth rejected after full credential refresh (rc={rc})",
-                        )
-                        await self._give_up(auth_exc)
-                        return
                 else:
                     _logger.warning("MQTT error (rc=%s): %s — retry in %ds", rc, exc, backoff)
             except ReLoginRequiredError as exc:
