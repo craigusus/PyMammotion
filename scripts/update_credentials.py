@@ -61,7 +61,7 @@ def main() -> None:
     args = parser.parse_args()
 
     const_path = Path(__file__).parent.parent / "pymammotion" / "const.py"
-    content = const_path.read_text()
+    content = const_path.read_text(encoding="utf-8")
 
     if not _SENTINEL_RE.search(content):
         raise SystemExit(f"Sentinel block not found in {const_path}")
@@ -85,7 +85,7 @@ def main() -> None:
         )
 
     content = _SENTINEL_RE.sub(replacement, content)
-    const_path.write_text(content)
+    const_path.write_text(content, encoding="utf-8")
     print(f"Updated {const_path}")
 
 
