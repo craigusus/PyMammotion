@@ -1285,6 +1285,10 @@ class MammotionClient:
         """
         from pymammotion.data.model.device import create_device
 
+        if self._device_registry.get(device_name) is not None:
+            _logger.debug("_register_device_on_transport: %s already registered — skipping", device_name)
+            return
+
         handle = DeviceHandle(
             device_id=device_name,
             device_name=device_name,
