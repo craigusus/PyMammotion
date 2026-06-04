@@ -1711,10 +1711,10 @@ class MammotionClient:
         discovery_failed = False
         if check_for_new_devices:
             try:
-                # Refresh the restored Aliyun session before the device-list call: the
-                # cached iotToken may have expired since it was persisted, and
-                # list_binding_by_account uses it directly (it would 401/460 otherwise).
-                await cloud_client.check_or_refresh_session()
+                # Force-refresh the restored Aliyun session before the device-list call:
+                # the cached iotToken may be server-side rejected even if our local expiry
+                # clock says it is still valid (e.g. a prior session invalidated it).
+                await cloud_client.check_or_refresh_session(force=True)
                 session_data = (
                     cloud_client.session_by_authcode_response.data
                     if cloud_client.session_by_authcode_response is not None
