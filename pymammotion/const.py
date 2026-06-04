@@ -2,7 +2,7 @@
 
 import os
 
-# --- credentials: injected at build time via scripts/update_credentials.py — do not edit ---
+# --- credentials: injected at build time via scripts/update_credentials.py - do not edit ---
 def _r(d: tuple[int, ...]) -> str:
     _k = (109, 97, 109, 109, 111, 116, 105, 111, 110, 95, 97, 112, 112)
     return bytes(v ^ _k[i % len(_k)] for i, v in enumerate(d)).decode()
