@@ -395,12 +395,11 @@ class MQTTTransport(Transport):
     async def _run(self) -> None:
         """Run the main connection loop.
 
-        Auth recovery: on a broker auth rejection we force ONE full credential
-        refresh and retry immediately.  If the broker still rejects after the
-        refresh, we back off (same as a non-auth disconnect) and retry — the
-        broker may transiently reject a freshly-minted token while propagating
-        the rotation.  We only give up permanently after
-        _AUTH_CONSECUTIVE_GIVE_UP consecutive auth rejections.
+        Auth recovery is deliberately minimal: on a broker auth rejection we force
+        ONE full credential refresh (refresh-token based — never ``login_v2``) and
+        retry; if the broker still rejects, we give up (``_give_up`` marks this
+        transport unrecoverable and signals the affected mowers).  Non-auth
+        disconnects reconnect with exponential backoff as usual.
         """
         backoff = _MQTT_RECONNECT_MIN_SEC
         auth_force_refreshed = False
@@ -481,14 +480,8 @@ class MQTTTransport(Transport):
                             auth_force_refreshed = True
                             continue
                     else:
-                        # Already force-refreshed this cycle and the broker still
-                        # rejects.  The broker may transiently reject a freshly-minted
-                        # token during propagation — back off and retry rather than
-                        # giving up immediately.  Only give up after several consecutive
-                        # failures so a brief broker hiccup doesn't permanently disable
-                        # the transport.
                         auth_consecutive_failures += 1
-                        auth_force_refreshed = False  # force-refresh again next attempt
+                        auth_force_refreshed = False
                         if auth_consecutive_failures >= _AUTH_CONSECUTIVE_GIVE_UP:
                             _logger.error(
                                 "MQTT auth still rejected after %d consecutive refreshes (rc=%s) — "

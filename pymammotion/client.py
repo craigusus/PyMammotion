@@ -321,6 +321,7 @@ class MammotionClient:
             lambda s: s.raw.report_data.locations[0].bol_hash if s.raw.report_data.locations else 0,  # type: ignore
             _on_bol_hash_changed,
         )
+
         self._watcher_subscriptions[device_name] = [
             sub,
             progress_sub,
@@ -1362,9 +1363,6 @@ class MammotionClient:
                 return True
             except Exception as exc:
                 if is_transient_network_error(exc):
-                    # DNS / network down — not an auth failure.  Re-raise the original
-                    # network error so the MQTT transport's reconnect backoff handles it
-                    # rather than treating the outage as an unrecoverable credential problem.
                     raise
                 _logger.exception("Full re-login failed after Aliyun bind token expiry")
                 raise ReLoginRequiredError(
@@ -1410,9 +1408,6 @@ class MammotionClient:
                 _logger.info("Aliyun transport reconnect scheduled after final re-login")
             except Exception as relogin_exc:
                 if is_transient_network_error(relogin_exc):
-                    # DNS / network down during the final re-login attempt.  The credentials
-                    # may still be valid — schedule a reconnect and let the backoff loop
-                    # retry rather than marking the transport unrecoverable.
                     _logger.warning(
                         "Aliyun final re-login skipped (network unavailable) — will retry on reconnect: %s",
                         relogin_exc,
@@ -1715,27 +1710,15 @@ class MammotionClient:
         discovery_failed = False
         if check_for_new_devices:
             try:
-                # Force-refresh the restored Aliyun session before the device-list call:
-                # the cached iotToken may be server-side rejected even if our local expiry
-                # clock says it is still valid (e.g. a prior session invalidated it).
-                try:
-                    await cloud_client.check_or_refresh_session(force=True)
-                except SessionExpiredError:
-                    # The cached Aliyun refreshToken is genuinely expired — escalate to a
-                    # full IoT re-login using the stored HTTP credentials rather than just
-                    # skipping discovery.  This re-runs the full Aliyun IoT login sequence
-                    # (connect, login_by_oauth, aep_handle, session_by_auth_code) so the
-                    # new iotToken and refreshToken are stored in cloud_client before the
-                    # list_binding_by_account call below.
-                    _logger.warning(
-                        "restore_credentials: Aliyun refreshToken expired for account %s — "
-                        "escalating to full IoT re-login",
-                        account,
-                    )
-                    await TokenManager.connect_iot(cloud_client)
-                    if acct_session.token_manager is not None:
-                        await acct_session.token_manager.refresh_aliyun_credentials()
-
+                # Force-refresh the restored Aliyun session before the device-list call.
+                # On a cold restore the cached iotToken cannot be trusted: HA may have been
+                # offline for hours, and Aliyun's single-session-per-identity model means the
+                # phone app (or another client) logging in rotates/invalidates our token well
+                # before its nominal 20 h expiry.  The freshness-gated check would see the
+                # token as still valid and skip the refresh, so list_binding_by_account would
+                # send the stale token and get a 401 "request auth error".  force=True always
+                # mints a fresh token via the (longer-lived) refreshToken.
+                await cloud_client.check_or_refresh_session(force=True)
                 session_data = (
                     cloud_client.session_by_authcode_response.data
                     if cloud_client.session_by_authcode_response is not None
@@ -2483,6 +2466,23 @@ class MammotionClient:
         transport.set_ble_device(ble_device)
         await handle.add_transport(transport)
 
+    async def _fetch_stream_subscription(self, http: MammotionHTTP, iot_id: str, is_yuka: bool) -> Any:
+        """Fetch the stream subscription token, retrying once if the response carries no data.
+
+        The Mammotion stream-token endpoint intermittently returns an empty ``data``
+        payload; a single immediate retry usually succeeds.  The empty response is
+        logged at error level so the failure is visible even when the retry recovers.
+        """
+        subscription = await http.get_stream_subscription(iot_id, is_yuka)
+        if subscription is None or subscription.data is None:
+            _logger.error(
+                "get_stream_subscription for %s returned no data (response=%s) — retrying once",
+                iot_id,
+                subscription,
+            )
+            subscription = await http.get_stream_subscription(iot_id, is_yuka)
+        return subscription
+
     async def get_stream_subscription(self, device_name: str, iot_id: str) -> Any:
         """Return a stream subscription response for the named device.
 
@@ -2498,7 +2498,7 @@ class MammotionClient:
         if http is None:
             return None
         is_yuka = DeviceType.is_yuka(device_name)
-        subscription = await http.get_stream_subscription(iot_id, is_yuka)
+        subscription = await self._fetch_stream_subscription(http, iot_id, is_yuka)
 
         if handle := self._device_registry.get_by_name(device_name):
             try:
@@ -2524,7 +2524,7 @@ class MammotionClient:
         if http is None:
             return None
         is_yuka = DeviceType.is_yuka(device_name)
-        subscription = await http.get_stream_subscription(iot_id, is_yuka)
+        subscription = await self._fetch_stream_subscription(http, iot_id, is_yuka)
 
         if handle := self._device_registry.get_by_name(device_name):
             try:
