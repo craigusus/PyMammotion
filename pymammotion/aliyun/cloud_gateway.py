@@ -622,6 +622,9 @@ class CloudIOTGateway:
             logger.debug(response.status_code)
             logger.debug(response.body)
 
+            if response.status_code == 429:
+                raise TooManyRequestsException("check_or_refresh_session rate limited (429)", "")
+
             response_body_str = response.body.decode("utf-8")
             response_body_dict = self.parse_json_response(response_body_str)
 

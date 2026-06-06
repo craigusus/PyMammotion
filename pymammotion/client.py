@@ -52,6 +52,7 @@ from mashumaro import MissingField
 
 from pymammotion.account.registry import BLE_ONLY_ACCOUNT, AccountRegistry, AccountSession
 from pymammotion.aliyun.cloud_gateway import CloudIOTGateway
+from pymammotion.aliyun.exceptions import TooManyRequestsException
 from pymammotion.auth.token_manager import MQTTCredentials, TokenManager
 from pymammotion.bluetooth.manager import BLETransportManager
 from pymammotion.data.model import GenerateRouteInformation
@@ -1730,7 +1731,17 @@ class MammotionClient:
                 # token as still valid and skip the refresh, so list_binding_by_account would
                 # send the stale token and get a 401 "request auth error".  force=True always
                 # mints a fresh token via the (longer-lived) refreshToken.
-                await cloud_client.check_or_refresh_session(force=True)
+                try:
+                    await cloud_client.check_or_refresh_session(force=True)
+                except TooManyRequestsException:
+                    # Aliyun rate-limited the token refresh on restore — the cached
+                    # iotToken is still present and may be valid; proceed with it
+                    # and let the next scheduled refresh mint a fresh one.
+                    _logger.warning(
+                        "restore_credentials: Aliyun rate-limited token refresh (429) — "
+                        "proceeding with cached iotToken for account %s",
+                        account,
+                    )
                 session_data = (
                     cloud_client.session_by_authcode_response.data
                     if cloud_client.session_by_authcode_response is not None
