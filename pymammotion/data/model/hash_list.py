@@ -317,23 +317,31 @@ class Plan(DataClassORJSONMixin):
     def is_enabled(self) -> bool:
         """Return True when the plan's enable flag (``reserved[2]``) is set.
 
-        Plans with a missing or short ``reserved`` buffer (e.g. legacy
-        firmware or freshly constructed Plan objects) default to enabled —
-        matching the APK's behaviour when the byte is absent.
+        The device adds +10 to every reserved byte on echo, so byte 2 arrives
+        as 10 (enabled) or 11 (disabled) in stored plans.  After a local
+        ``with_enabled`` call the byte is 0 (enabled) or 1 (disabled) — the
+        pre-echo value that will be sent to the device.  Both encodings are
+        recognised so ``is_enabled()`` is correct on both received and
+        just-modified plans.  Plans with a missing or short buffer default to
+        enabled (matching APK behaviour).
         """
         raw = self.reserved.encode("latin-1") if self.reserved else b""
-        return raw[2] == 1 if len(raw) > 2 else True
+        if len(raw) <= 2:
+            return True
+        # 0 = enabled (app/send encoding); 10 = enabled (device-echo encoding)
+        return raw[2] in (0, 10)
 
     def with_enabled(self, enabled: bool) -> Plan:
-        """Return a copy of this plan with ``reserved[2]`` set to *enabled*.
+        """Return a copy of this plan with ``reserved[2]`` set for *enabled*.
 
-        Bytes 0,1,3,4,5,6,7 are preserved verbatim from the existing
-        ``reserved`` buffer (or padded to 8 zero bytes when absent).
+        Sends byte 2 = 0 (enable) or 1 (disable) — the device adds +10 to all
+        bytes on echo, so it will store/return 10 (enabled) or 11 (disabled).
+        Bytes 0,1,3..7 are preserved verbatim.
         """
         raw = bytearray(self.reserved.encode("latin-1") if self.reserved else b"")
         if len(raw) < 8:
             raw.extend(b"\x00" * (8 - len(raw)))
-        raw[2] = 1 if enabled else 0
+        raw[2] = 0 if enabled else 1
         return dataclasses.replace(self, reserved=raw.decode("latin-1"))
 
     def with_renamed(self, new_name: str) -> Plan:
@@ -509,15 +517,19 @@ class HashList(DataClassORJSONMixin):
 
     @property
     def area_root_hashlist(self) -> list[int]:
-        """Return hash IDs from ``root_hash_lists`` entries with ``sub_cmd == 0`` (area)."""
+        """Return hash IDs from ``root_hash_lists`` entries with ``sub_cmd == 0`` (area).
+
+        Frames are sorted by ``current_frame`` so the concatenated list is in the
+        same position order the device used when building its ``bol_hash``.
+        """
         if not self.root_hash_lists:
             return []
         return [
             i
             for root_list in self.root_hash_lists
-            for obj in root_list.data
-            for i in obj.data_couple
             if root_list.sub_cmd == 0
+            for obj in sorted(root_list.data, key=lambda d: d.current_frame)
+            for i in obj.data_couple
         ]
 
     @property
@@ -983,8 +995,6 @@ class HashList(DataClassORJSONMixin):
         """
         if not bol_hash:
             return False
-        if MurMurHashUtil.hash_unsigned_list(self.area_root_hashlist) != bol_hash:
-            return False
         if self.computed_bol_hash != bol_hash:
             return False
         if self.find_incomplete_hashes(0):
@@ -1009,7 +1019,7 @@ class HashList(DataClassORJSONMixin):
         than now.  Hash IDs that remain in the new list re-use their cached
         frames and are not re-fetched.
         """
-        if not bol_hash or MurMurHashUtil.hash_unsigned_list(self.area_root_hashlist) == bol_hash:
+        if not bol_hash or self.computed_bol_hash == bol_hash:
             return
         self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != 0]
         self.update_hash_lists(self.hashlist)

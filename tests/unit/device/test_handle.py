@@ -821,6 +821,53 @@ def test_transport_rate_limit_constant_matches_handle_backoff() -> None:
     assert t._RATE_LIMIT_DURATION == _RATE_LIMITED_BACKOFF  # noqa: SLF001
 
 
+def test_quota_block_self_clears_when_window_slides_under_limit() -> None:
+    """The self-imposed send-quota must release the instant the rolling window drops back
+    under the limit — no fixed-duration ban (that is reserved for cloud 429s)."""
+    from unittest.mock import patch
+
+    t = _make_concrete_transport()
+    limit = t._SEND_LIMIT  # noqa: SLF001
+    window = t._SEND_WINDOW  # noqa: SLF001
+    clock = {"now": 100_000.0}
+
+    with patch("pymammotion.transport.base.time.monotonic", side_effect=lambda: clock["now"]):
+        for _ in range(limit):
+            t.record_send()
+
+        # Quota exhausted — blocked — but NO fixed cloud ban was imposed.
+        assert t.is_rate_limited is True
+        assert t._rate_limited_until == 0.0  # noqa: SLF001 — quota path must not set the cloud timer
+        # Release is exactly one window after the oldest send.
+        assert t.seconds_until_send_available() == window
+
+        # Slide the window so the oldest send ages out → count drops to limit-1.
+        clock["now"] += window + 1.0
+        assert t.is_rate_limited is False
+        assert t.seconds_until_send_available() == 0.0
+
+
+def test_seconds_until_send_available_is_max_of_cloud_ban_and_quota() -> None:
+    """When both a cloud ban and the quota are active, the longer release time wins."""
+    from unittest.mock import patch
+
+    t = _make_concrete_transport()
+    clock = {"now": 0.0}
+
+    with patch("pymammotion.transport.base.time.monotonic", side_effect=lambda: clock["now"]):
+        t._rate_limited_until = 100.0  # noqa: SLF001 — short cloud ban
+        for _ in range(t._SEND_LIMIT):  # noqa: SLF001 — full window, release a whole window away
+            t.record_send()
+
+        # Quota release (_SEND_WINDOW) dominates the 100 s cloud ban.
+        assert t.seconds_until_send_available() == t._SEND_WINDOW  # noqa: SLF001
+
+        # Clear the quota; the cloud ban now dominates.
+        t._send_timestamps.clear()  # noqa: SLF001
+        assert t.seconds_until_send_available() == 100.0
+        assert t.is_rate_limited is True  # cloud ban still active
+
+
 # ---------------------------------------------------------------------------
 # _send_marked raises TransportRateLimitedError when transport is rate-limited
 # ---------------------------------------------------------------------------
@@ -1619,9 +1666,11 @@ async def test_stale_event_dropped(transport: AliyunMQTTTransport):
 
 
 @pytest.mark.asyncio
-async def test_event_without_time_forwarded(transport: AliyunMQTTTransport):
-    """Events with params.time=0 (missing) are not dropped."""
-    raw = _make_event_envelope(0)
+async def test_event_without_any_timestamp_forwarded(transport: AliyunMQTTTransport):
+    """Events with no usable envelope timestamp (time/generateTime/gmtCreate) are not dropped."""
+    payload = json.loads(_make_event_envelope(0))
+    payload["params"]["gmtCreate"] = 0  # the helper's fixture value would trip the fallback
+    raw = json.dumps(payload).encode()
 
     await transport._dispatch_aliyun_event("/sys/testpk/testdn/app/down/thing/events", raw)
 
@@ -1629,24 +1678,70 @@ async def test_event_without_time_forwarded(transport: AliyunMQTTTransport):
 
 
 @pytest.mark.asyncio
-async def test_stale_properties_dropped(transport: AliyunMQTTTransport):
-    """Stale thing/properties messages are also dropped."""
-    now_ms = int(time.time() * 1000)
+async def test_event_without_time_falls_back_to_gmt_create(transport: AliyunMQTTTransport):
+    """Events missing params.time are filtered via gmtCreate (stale fixture value → dropped)."""
+    raw = _make_event_envelope(0)  # helper sets gmtCreate=1714000000000 (ancient)
+
+    await transport._dispatch_aliyun_event("/sys/testpk/testdn/app/down/thing/events", raw)
+
+    transport.on_device_event.assert_not_called()
+
+
+def _make_properties_envelope(generate_time_ms: int) -> bytes:
+    """Realistic thing/properties envelope: carries generateTime/gmtCreate, NO params.time."""
     payload = {
         "method": "thing.properties",
         "id": "test-props-id",
         "version": "1.0",
         "params": {
+            "deviceType": "LawnMower",
+            "checkFailedData": {},
+            "groupIdList": [],
+            "_tenantId": "",
+            "groupId": "",
+            "categoryKey": "LawnMower",
+            "batchId": "",
+            "gmtCreate": generate_time_ms,
+            "productKey": "testpk",
+            "generateTime": generate_time_ms,
+            "deviceName": "testdn",
+            "_traceId": "",
             "iotId": "test_iot_id",
-            "time": now_ms - _STALE_EVENT_THRESHOLD_MS - 30_000,
-            "items": {},
+            "JMSXDeliveryCount": 1,
+            "checkLevel": 0,
+            "qos": 1,
+            "requestId": "1",
+            "_categoryKey": "TmallGenie.LawnMower",
+            "namespace": "",
+            "tenantId": "",
+            "thingType": "DEVICE",
+            "items": {"batteryPercentage": {"time": generate_time_ms, "value": 80}},
+            "tenantInstanceId": "",
         },
     }
-    raw = json.dumps(payload).encode()
+    return json.dumps(payload).encode()
+
+
+@pytest.mark.asyncio
+async def test_stale_properties_dropped(transport: AliyunMQTTTransport):
+    """Stale thing/properties are dropped via generateTime (they carry no params.time)."""
+    now_ms = int(time.time() * 1000)
+    raw = _make_properties_envelope(now_ms - _STALE_EVENT_THRESHOLD_MS - 30_000)
 
     await transport._dispatch_aliyun_event("/sys/testpk/testdn/app/down/thing/properties", raw)
 
     transport.on_device_properties.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fresh_properties_forwarded(transport: AliyunMQTTTransport):
+    """Fresh thing/properties (recent generateTime, no params.time) are forwarded."""
+    now_ms = int(time.time() * 1000)
+    raw = _make_properties_envelope(now_ms - 5_000)
+
+    await transport._dispatch_aliyun_event("/sys/testpk/testdn/app/down/thing/properties", raw)
+
+    transport.on_device_properties.assert_called_once()
 
 
 @pytest.mark.asyncio

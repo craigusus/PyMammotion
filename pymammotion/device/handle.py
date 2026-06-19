@@ -345,6 +345,14 @@ class DeviceHandle:
                     # rather than sleeping out the rest of its 180 s idle period.
                     self._rearm_event.set()
                     if state == TransportAvailability.DISCONNECTED:
+                        # Cancel the BLE heartbeat loop so it stops retrying
+                        # against a dead connection instead of exhausting all
+                        # 30 attempts.  task.cancel() schedules CancelledError
+                        # at the next await inside the task (asyncio.sleep) —
+                        # safe to call from within the task itself.
+                        ka_task = self._ble_keep_alive_task
+                        if ka_task is not None and not ka_task.done():
+                            ka_task.cancel()
                         # Cancel the BLE polling loop so the MQTT loop can resume
                         # without waiting up to _BLE_MODE_RECHECK_INTERVAL for
                         # the loop to detect the disconnect on its own.
@@ -648,8 +656,13 @@ class DeviceHandle:
             await self._status_bus.emit(msg)
 
         online = msg.params.status.value is StatusType.CONNECTED
-        if online and not self._stopping and time.monotonic() - self._last_report_at > self._REPORT_STALE_THRESHOLD:
-            await self.request_report_cfg(dedup_key="report_cfg_on_status")
+
+        if self._availability.mqtt_reported_offline:
+            if online and not self._stopping and time.monotonic() - self._last_report_at > self._REPORT_STALE_THRESHOLD:
+                await self.request_report_cfg(dedup_key="report_cfg_on_status")
+
+            if cloud_transport := self.cloud_transport():
+                self.update_availability(cloud_transport, self._availability.mqtt, mqtt_reported_offline=not online)
 
     async def request_report_cfg(self, *, dedup_key: str = "report_cfg") -> None:
         """Enqueue a get_report_cfg command in the background."""
@@ -667,8 +680,14 @@ class DeviceHandle:
 
     async def on_mammotion_properties(self, properties: MammotionPropertiesMessage) -> None:
         """Update device state from a Mammotion MQTT flat property push."""
+
+        if self._availability.mqtt_reported_offline:
+            if cloud_transport := self.cloud_transport():
+                self.update_availability(cloud_transport, self._availability.mqtt, mqtt_reported_offline=False)
+
         updated = self._reducer.apply_mammotion_properties(self.state_machine.current.raw, properties)
         snapshot, _ = self.state_machine.apply(updated, self._availability)
+
         if not self._stopping:
             await self._state_changed_bus.emit(snapshot)
 
@@ -692,6 +711,10 @@ class DeviceHandle:
             except Exception:
                 _logger.debug("on_device_event: failed to decode protobuf content", exc_info=True)
         else:
+            if self._availability.mqtt_reported_offline:
+                if cloud_transport := self.cloud_transport():
+                    self.update_availability(cloud_transport, self._availability.mqtt, mqtt_reported_offline=False)
+
             updated = dataclasses.replace(self.state_machine.current.raw, device_event=event)
             snapshot, _ = self.state_machine.apply(updated, self._availability)
             if not self._stopping:
@@ -709,6 +732,11 @@ class DeviceHandle:
         """
         # Let the reducer extract any typed fields it knows about (no-op for mowers).
         device_with_props = self._reducer.apply_properties(self.state_machine.current.raw, properties)
+
+        if self._availability.mqtt_reported_offline:
+            if cloud_transport := self.cloud_transport():
+                self.update_availability(cloud_transport, self._availability.mqtt, mqtt_reported_offline=False)
+
         # Always persist the raw envelope so subscribers can inspect it.
         updated = dataclasses.replace(device_with_props, mqtt_properties=properties)
         snapshot, _ = self.state_machine.apply(updated, self._availability)
@@ -1306,14 +1334,14 @@ class DeviceHandle:
         case (RPT_KEEPs land but reports stop arriving) is handled by the
         stale watchdog in ``ble_polling_loop``.
         """
-        sync_bytes = self.commands.send_todev_ble_sync(sync_type=2)
+        sync_bytes = self.commands.send_todev_ble_sync(sync_type=3)
         attempts = [0]
 
         async def _send() -> None:
             attempts[0] += 1
             if attempts[0] > 1:
                 try:
-                    _logger.debug("RPT_START [%s]: retry-prefix sending todev_ble_sync(2)", self.device_name)
+                    _logger.debug("RPT_START [%s]: retry-prefix sending todev_ble_sync(3)", self.device_name)
                     await transport_send(sync_bytes)
                 except Exception:  # noqa: BLE001
                     _logger.debug(
@@ -1812,6 +1840,15 @@ class DeviceHandle:
         except NoTransportAvailableError:
             return False
         return True
+
+    def cloud_transport(self) -> TransportType | None:
+        mqtt = None
+        for transport_type in (TransportType.CLOUD_ALIYUN, TransportType.CLOUD_MAMMOTION):
+            t = self._transports.get(transport_type)
+            if t is not None:
+                mqtt = transport_type
+                break
+        return mqtt
 
     def active_transport(self, *, prefer_ble: bool | None = None) -> Transport:
         """Return the best transport to send on *right now*.
