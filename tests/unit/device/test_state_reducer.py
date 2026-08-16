@@ -619,9 +619,10 @@ def test_partial_property_post_model_fields_only() -> None:
     assert p.int_mod == "SPINO E1"
     assert p.ext_mod == "SPINO E1"
 
-    # Absent fields default rather than raising; absent nested objects are None.
-    assert p.device_state == 0
-    assert p.battery_percentage == 0
+    # Absent fields decode as None (numeric) / "" (string) rather than raising;
+    # None lets consumers distinguish "not reported" from a genuine 0.
+    assert p.device_state is None
+    assert p.battery_percentage is None
     assert p.device_version == ""
     assert p.network_info is None
     assert p.coordinate is None
@@ -641,7 +642,7 @@ def test_partial_property_post_firmware_only() -> None:
     assert [fw.c for fw in p.device_version_info.fw_info] == ["63-PAWG4", "65-PACG4"]
 
     # Everything else defaults / is None.
-    assert p.battery_percentage == 0
+    assert p.battery_percentage is None
     assert p.network_info is None
     assert p.coordinate is None
 
@@ -649,7 +650,7 @@ def test_partial_property_post_firmware_only() -> None:
 def test_device_properties_accepts_empty_params() -> None:
     """A property/post with no params at all still decodes (every field optional)."""
     p = DeviceProperties.from_dict({})
-    assert p.device_state == 0
+    assert p.device_state is None
     assert p.network_info is None
 
 
@@ -752,9 +753,13 @@ class TestStateReducerAreaNameFallback:
         assert by_hash == {111: "area 1", 222: "area 2"}
 
     def test_mixed_named_and_unnamed_areas(self) -> None:
+        """A real name reserves no number, so the unnamed area takes the lowest free
+        one — matching HashList.computed_areas' gap-fill rather than numbering by
+        position, which would make the label depend on how many areas precede it.
+        """
         result = self._apply_empty(_device_with_named_areas({111: "Voor", 222: ""}))
         by_hash = {a.hash: a.name for a in result.map.area_name}
-        assert by_hash == {111: "Voor", 222: "area 2"}
+        assert by_hash == {111: "Voor", 222: "area 1"}
 
     def test_explicit_hashnames_win_over_name_time(self) -> None:
         device = _device_with_named_areas({111: "Voor"})
@@ -762,6 +767,39 @@ class TestStateReducerAreaNameFallback:
             device, LubaMsg(nav=MctlNav(toapp_all_hash_name=_AGAHN(hashnames=[_AHName(hash=111, name="Front Lawn")])))
         )
         assert {a.hash: a.name for a in result.map.area_name}[111] == "Front Lawn"
+
+    def test_existing_numbers_survive_a_new_area_arriving(self) -> None:
+        """A fallback label is baked into the HA entity_id at registration, so an
+        area that already has one must keep it.  Numbering by position in
+        sorted(map.area) renumbers every area above a newly-arrived hash.
+        """
+        device = _device_with_named_areas({111: "", 222: ""})
+        device = self._apply_empty(device)
+        assert {a.hash: a.name for a in device.map.area_name} == {111: "area 1", 222: "area 2"}
+
+        # A third area arrives whose hash sorts BELOW the other two.
+        device.map.area[10] = _FL(data=[_area_frame_named(10, "")])
+        device = self._apply_empty(device)
+        by_hash = {a.hash: a.name for a in device.map.area_name}
+        assert by_hash[111] == "area 1", "existing area was renumbered"
+        assert by_hash[222] == "area 2", "existing area was renumbered"
+        assert by_hash[10] == "area 3", "new area must take the lowest free number"
+
+    def test_transient_areas_do_not_shift_the_real_ones(self) -> None:
+        """Real hashes from a Luba 3 that displayed as area 4/5/6: three extra
+        hashes arrived mid-fetch, were numbered ahead of the real areas, then
+        pruned — leaving the real areas permanently labelled from 4.
+        """
+        real = [507072516911571140, 1231479802544112924, 2094378125895869177]
+        device = _device_with_named_areas(dict.fromkeys(real, ""))
+        device = self._apply_empty(device)
+        assert [a.name for a in device.map.area_name] == ["area 1", "area 2", "area 3"]
+
+        for extra in (101, 202, 303):  # sort below every real hash
+            device.map.area[extra] = _FL(data=[_area_frame_named(extra, "")])
+        device = self._apply_empty(device)
+        by_hash = {a.hash: a.name for a in device.map.area_name}
+        assert [by_hash[h] for h in real] == ["area 1", "area 2", "area 3"]
 
     def test_name_does_not_flip_on_repeated_empty_hash_name(self) -> None:
         device = _device_with_named_areas({111: "Voor", 222: "Achter"})
@@ -828,3 +866,238 @@ def test_mammotion_coordinate_zero_is_left_unset() -> None:
 
     assert updated.location.device.latitude == 12.0
     assert updated.location.device.longitude == 34.0
+
+
+def test_mammotion_partial_push_uses_presence_not_truthiness() -> None:
+    """A partial flat-property push must key on field PRESENCE (None == absent),
+    not truthiness — an omitted field is left untouched, but a genuine 0 is applied.
+
+    Post-2025 "Mammotion" devices interleave the flat-property push with the
+    protobuf report; without this an omitted field arrives as 0 and blanks out
+    sys_status / battery / blade height every other update. Using truthiness would
+    fix that but wrongly drop a real 0 (e.g. 0% battery), so the fields are Optional
+    and guarded with ``is not None``.
+    """
+    from pymammotion.data.mqtt.mammotion_properties import DeviceProperties
+    from pymammotion.data.mqtt.properties import MammotionPropertiesMessage
+
+    reducer = MowerStateReducer()
+    device = _make_device()
+    device.report_data.dev.sys_status = 13   # MODE_WORKING
+    device.report_data.dev.battery_val = 82
+    device.report_data.work.knife_height = 50
+
+    # Absent fields (None) must be left untouched.
+    empty = MammotionPropertiesMessage(id="1", version="1.0", sys={}, params=DeviceProperties())
+    updated = reducer.apply_mammotion_properties(device, empty)
+    assert updated.report_data.dev.sys_status == 13
+    assert updated.report_data.dev.battery_val == 82
+    assert updated.report_data.work.knife_height == 50
+
+    # A genuine 0% battery IS present and must be applied (not treated as absent).
+    zero = MammotionPropertiesMessage(
+        id="2", version="1.0", sys={}, params=DeviceProperties(battery_percentage=0)
+    )
+    updated = reducer.apply_mammotion_properties(device, zero)
+    assert updated.report_data.dev.battery_val == 0
+    assert updated.report_data.dev.sys_status == 13  # still untouched (absent)
+
+    # Non-zero values still update.
+    real = MammotionPropertiesMessage(
+        id="3", version="1.0", sys={},
+        params=DeviceProperties(device_state=14, battery_percentage=79, knife_height=60),
+    )
+    updated = reducer.apply_mammotion_properties(device, real)
+    assert updated.report_data.dev.sys_status == 14
+    assert updated.report_data.dev.battery_val == 79
+    assert updated.report_data.work.knife_height == 60
+
+
+# ===========================================================================
+# PoolStateReducer — fw info, net envelope, devStatus extras, error clamp.
+# ===========================================================================
+from pymammotion.data.model.pool_state import SpinoSysStatus, SpinoWorkMode
+from pymammotion.proto import (
+    DeviceFwInfo,
+    DevNet,
+    DevStatueT,
+    DrvWifiMsg,
+    ModFwInfo,
+    ReportInfoT,
+    ResponseSetModeT,
+    SysSetDateTime,
+    SystemUpdateBufMsg,
+    WifiIotStatusReport,
+)
+
+
+def test_pool_fw_info_populates_device_firmwares() -> None:
+    msg = LubaMsg(
+        sys=MctlSys(
+            toapp_dev_fw_info=DeviceFwInfo(
+                result=1,
+                version="1.15.2.1047",
+                mod=[
+                    ModFwInfo(type=63, identify="63-PAWG4", version="1.2.0.281"),
+                    ModFwInfo(type=65, identify="65-PACG4", version="1.2.0.273"),
+                    ModFwInfo(type=67, identify="67-PESP", version="0.0.0.299"),
+                    ModFwInfo(type=61, identify="61-PAMH5", version="5.1.2.2159"),
+                    ModFwInfo(type=62, identify="62-PMH5BT", version="5.1.2.2131"),
+                ],
+            )
+        )
+    )
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    fw = result.device_firmwares
+    assert fw.device_version == "1.15.2.1047"
+    assert fw.wheel_hub_motor == "1.2.0.281"
+    assert fw.water_pump == "1.2.0.273"
+    assert fw.communication == "0.0.0.299"
+    assert fw.main_controller == "5.1.2.2159"
+    assert fw.main_controller_bt == "5.1.2.2131"
+
+
+def test_pool_fw_info_result_zero_ignored() -> None:
+    msg = LubaMsg(sys=MctlSys(toapp_dev_fw_info=DeviceFwInfo(result=0, version="9.9.9")))
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.device_firmwares.device_version == ""
+
+
+def test_pool_wifi_iot_status_updates_connectivity() -> None:
+    msg = LubaMsg(
+        net=DevNet(
+            toapp_wifi_iot_status=WifiIotStatusReport(
+                wifi_connected=True, iot_connected=True, productkey="a15Cq8FbCh1", devicename="Spino-E1abc"
+            )
+        )
+    )
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.pool_state.wifi_connected is True
+    assert result.pool_state.iot_connected is True
+    assert result.product_key == "a15Cq8FbCh1"
+
+
+def test_pool_wifi_iot_status_empty_productkey_not_clobbered() -> None:
+    device = PoolCleanerDevice(name="Spino-E1abc", product_key="seeded")
+    msg = LubaMsg(net=DevNet(toapp_wifi_iot_status=WifiIotStatusReport(wifi_connected=True, iot_connected=False)))
+    result = PoolStateReducer().apply(device, msg)
+    assert result.product_key == "seeded"
+    assert result.pool_state.iot_connected is False
+
+
+def test_pool_wifi_msg_updates_network_info_but_never_password() -> None:
+    msg = LubaMsg(
+        net=DevNet(
+            toapp_WifiMsg=DrvWifiMsg(
+                status1=True,
+                status2=True,
+                ip="192.168.20.174",
+                msgssid="IOT",
+                password="battery-easeful-dental",
+                rssi=-38,
+                wifi_enable=True,
+            )
+        )
+    )
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.wifi_ssid == "IOT"
+    assert result.ip == "192.168.20.174"
+    assert result.wifi_enabled is True
+    assert result.pool_state.wifi_rssi == -38
+    assert "battery-easeful-dental" not in str(result.to_dict())
+
+
+def test_pool_dev_status_captures_rssi_and_connectivity() -> None:
+    msg = LubaMsg(
+        sys=MctlSys(
+            report_info=ReportInfoT(
+                dev_status=DevStatueT(
+                    sys_status=1,
+                    bat_val=70,
+                    model=100,
+                    ble_rssi=-48,
+                    wifi_rssi=-43,
+                    wifi_connect_status=1,
+                    iot_connect_status=1,
+                )
+            )
+        )
+    )
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.pool_state.battery == 70
+    assert result.pool_state.wifi_rssi == -43
+    assert result.pool_state.ble_rssi == -48
+    assert result.pool_state.wifi_connected is True
+    assert result.pool_state.iot_connected is True
+    assert result.pool_state.charging is False
+
+
+def test_pool_dev_status_charge_status_sets_charging() -> None:
+    # A docked Spino reports chargeStatus=1 while sys_status is still PREPARE (1),
+    # so charging is not derivable from sys_status alone.
+    msg = LubaMsg(sys=MctlSys(report_info=ReportInfoT(dev_status=DevStatueT(sys_status=1, charge_status=1))))
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.pool_state.charging is True
+    assert result.pool_state.sys_status is SpinoSysStatus.PREPARE
+
+
+def test_pool_dev_status_omitted_work_mode_reports_off() -> None:
+    # Heartbeat frames leave work_mode unset (proto3 default 0) once no job is
+    # running — that is "no mode active", not the RECHARGE command value.
+    device = PoolCleanerDevice(name="Spino-E1abc")
+    device.pool_state.work_mode = SpinoWorkMode.ECO
+    msg = LubaMsg(sys=MctlSys(report_info=ReportInfoT(dev_status=DevStatueT(sys_status=1, bat_val=68))))
+    result = PoolStateReducer().apply(device, msg)
+    assert result.pool_state.work_mode is SpinoWorkMode.OFF
+    assert result.pool_state.work_mode.name == "OFF"
+
+
+def test_pool_error_count_negative_clamped_to_zero() -> None:
+    data = [2, 43, -1] + [0] * 40
+    msg = LubaMsg(sys=MctlSys(system_update_buf=SystemUpdateBufMsg(update_buf_data=data)))
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.pool_state.error_count == 0
+    assert result.pool_state.error_log == []
+
+
+def test_pool_response_set_mode_applies_mode_and_session_times() -> None:
+    # Frame captured from a Spino-E1 mode switch (WALL) over the cloud transport.
+    msg = LubaMsg(
+        sys=MctlSys(
+            response_set_mode=ResponseSetModeT(
+                set_work_mode=3,
+                cur_work_mode=3,
+                start_work_time=1786694053,
+                end_work_time=1786694153,
+                cur_work_time=1,
+            )
+        )
+    )
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.pool_state.work_mode is SpinoWorkMode.WALL
+    assert result.pool_state.start_work_time == 1786694053
+    assert result.pool_state.end_work_time == 1786694153
+
+
+def test_pool_response_set_mode_history_request_echo_ignored() -> None:
+    # statue=2 is the job-history request form, not a mode ack — it must not
+    # reset the work mode or the session times.
+    device = PoolCleanerDevice(name="Spino-E1abc")
+    device.pool_state.work_mode = SpinoWorkMode.WALL
+    device.pool_state.start_work_time = 1786694053
+    msg = LubaMsg(sys=MctlSys(response_set_mode=ResponseSetModeT(statue=2)))
+    result = PoolStateReducer().apply(device, msg)
+    assert result.pool_state.work_mode is SpinoWorkMode.WALL
+    assert result.pool_state.start_work_time == 1786694053
+
+
+def test_pool_response_set_mode_unknown_mode_tolerated() -> None:
+    msg = LubaMsg(sys=MctlSys(response_set_mode=ResponseSetModeT(set_work_mode=99, cur_work_mode=99)))
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.pool_state.work_mode is SpinoWorkMode.UNKNOWN
+
+
+def test_pool_todev_data_time_is_silent_noop() -> None:
+    msg = LubaMsg(sys=MctlSys(todev_data_time=SysSetDateTime(year=234, month=7, date=20)))
+    result = PoolStateReducer().apply(PoolCleanerDevice(name="Spino-E1abc"), msg)
+    assert result.online is True

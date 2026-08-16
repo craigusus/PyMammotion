@@ -459,12 +459,14 @@ async def test_on_raw_message_drops_frame_with_malformed_report_data(caplog: pyt
     assert emitted == []
     error_records = [r for r in caplog.records if r.levelno == logging.ERROR and "dropping frame" in r.getMessage()]
     assert error_records, "expected an ERROR log for the dropped frame"
-    rendered = error_records[0].getMessage()
-    # The exception message (offending field + bad value) and the raw bytes must be logged
-    # so the bad data can be investigated.
-    assert 'Field "bp_pos_y"' in rendered
-    assert "invalid value [114, 30]" in rendered
-    assert payload.hex() in rendered
+    # The raw bytes belong in the message — they are what the traceback cannot supply.
+    assert payload.hex() in error_records[0].getMessage()
+    # The offending field and bad value must still reach the log; logger.exception puts
+    # them in the attached traceback rather than the message, so assert on the rendered
+    # output as an operator would actually read it.
+    assert error_records[0].exc_info is not None
+    assert 'Field "bp_pos_y"' in caplog.text
+    assert "invalid value [114, 30]" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +711,8 @@ def _make_mqtt_transport(*, connected: bool = True) -> MagicMock:
     t.transport_type = TransportType.CLOUD_ALIYUN
     t.is_connected = connected
     t.is_rate_limited = False
+    t.is_send_blocked = MagicMock(return_value=False)
+    t.seconds_until_send_available = MagicMock(return_value=0.0)
     t.send = AsyncMock()
     t.send_heartbeat = AsyncMock()
     t.set_rate_limited = MagicMock()
@@ -853,6 +857,7 @@ async def test_send_marked_raises_when_transport_rate_limited() -> None:
     handle = _make_rl_handle()
     mqtt = _make_mqtt_transport()
     mqtt.is_rate_limited = True
+    mqtt.is_send_blocked = MagicMock(return_value=True)
     handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
 
     with pytest.raises(TransportRateLimitedError):
@@ -895,6 +900,7 @@ async def test_send_raw_blocked_silently_when_already_rate_limited() -> None:
     handle = _make_rl_handle()
     mqtt = _make_mqtt_transport()
     mqtt.is_rate_limited = True
+    mqtt.is_send_blocked = MagicMock(return_value=True)
     handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
 
     await handle.send_raw(b"\x00")
@@ -942,6 +948,7 @@ async def test_send_raw_guard_does_not_call_set_rate_limited_again() -> None:
     handle = _make_rl_handle()
     mqtt = _make_mqtt_transport()
     mqtt.is_rate_limited = True
+    mqtt.is_send_blocked = MagicMock(return_value=True)
     handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
 
     # Call send_raw three times while the transport is already rate-limited.
@@ -954,138 +961,142 @@ async def test_send_raw_guard_does_not_call_set_rate_limited_again() -> None:
 
 
 # ===========================================================================
-# Verifies that every RPT_START goes through ``broker.send_and_wait`` expecting
+# RPT_START verification: two attempts, each waiting _RPT_ACK_TIMEOUT for the
+# device's report stream to tick, with a quota-free re-sync before the retry.
 # ===========================================================================
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from pymammotion.device.handle import DeviceHandle
-from pymammotion.transport.base import CommandTimeoutError, ConcurrentRequestError
 
 
 @pytest.fixture
 def rpt_handle(monkeypatch: pytest.MonkeyPatch) -> DeviceHandle:
-    """Bare DeviceHandle with broker + commands mocked.
+    """Bare DeviceHandle with just the state ``_send_rpt_start_verified`` touches.
 
     We bypass ``DeviceHandle.__init__`` entirely (it brings up a queue, reducer
-    etc. that aren't relevant here) and set just the attributes the helper
-    touches.  ``commands`` is a ``@property``, so we monkeypatch the descriptor
-    at the class level to return our mock.
+    etc. that aren't relevant here).  ``commands`` is a ``@property``, so we
+    monkeypatch the descriptor at the class level to return our mock.
     """
     h = DeviceHandle.__new__(DeviceHandle)
     h.device_name = "Luba-TEST"
-    h.broker = MagicMock()
-    h.broker.send_and_wait = AsyncMock()
+    h._last_report_data_at = 0.0
+    h._report_data_event = asyncio.Event()
     mocked_commands = MagicMock()
     mocked_commands.send_todev_ble_sync = MagicMock(return_value=b"\xAAsync")
     monkeypatch.setattr(DeviceHandle, "commands", property(lambda self: mocked_commands))
     return h
 
 
+def _feed_report(handle: DeviceHandle) -> None:
+    """Simulate a ``toapp_report_data`` frame landing, as ``on_raw_message`` would."""
+    handle._last_report_data_at = handle._last_report_data_at + 1.0
+    handle._report_data_event.set()
+
+
+@pytest.fixture(autouse=True)
+def _fast_ack_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the 5 s ack window so timeout paths don't stall the suite."""
+    monkeypatch.setattr("pymammotion.device.handle._RPT_ACK_TIMEOUT", 0.05)
+
+
 async def test_success_returns_true_and_sends_once(rpt_handle: DeviceHandle) -> None:
-    """First attempt succeeds: send_fn runs once with cmd_bytes only, no ble_sync."""
+    """A report frame during attempt 1 → True, one send, no sync."""
     cmd_bytes = b"\xBBcmd"
-    transport_send = AsyncMock()
+    sync_fn = AsyncMock()
 
-    # Drive send_and_wait to invoke our _send exactly once and "succeed"
-    async def _drive(send_fn, expected_field, **kwargs) -> None:
-        assert expected_field == "toapp_report_data"
-        await send_fn()  # one attempt, no exception
+    async def transport_send(_payload: bytes) -> None:
+        _feed_report(rpt_handle)
 
-    rpt_handle.broker.send_and_wait.side_effect = _drive
+    send_spy = AsyncMock(side_effect=transport_send)
 
-    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send)
+    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, send_spy, sync_fn)
 
     assert result is True
-    # send_fn ran once → transport_send called once with cmd_bytes (no ble_sync)
-    transport_send.assert_awaited_once_with(cmd_bytes)
+    send_spy.assert_awaited_once_with(cmd_bytes)
+    sync_fn.assert_not_awaited()
 
 
-async def test_retry_prefixes_ble_sync_then_cmd(rpt_handle: DeviceHandle) -> None:
-    """On the broker's 2nd attempt the send order is: ble_sync, then RPT_START.
-
-    The broker's retry budget is 2 attempts by default; we simulate that by
-    invoking _send twice from inside send_and_wait, then "succeeding".
-    """
+async def test_retry_syncs_before_resending(rpt_handle: DeviceHandle) -> None:
+    """Attempt 1 draws nothing → re-sync, then re-send; report on attempt 2 → True."""
     cmd_bytes = b"\xBBcmd"
-    sync_bytes = b"\xAAsync"
-    rpt_handle.commands.send_todev_ble_sync.return_value = sync_bytes
-    transport_send = AsyncMock()
+    calls: list[str] = []
 
-    async def _drive(send_fn, expected_field, **kwargs) -> None:
-        # Attempt 1
-        await send_fn()
-        # Attempt 2 (broker's retry)
-        await send_fn()
+    async def sync_fn() -> None:
+        calls.append("sync")
 
-    rpt_handle.broker.send_and_wait.side_effect = _drive
+    async def transport_send(_payload: bytes) -> None:
+        calls.append("cmd")
+        if calls.count("cmd") == 2:  # only the retry draws a report
+            _feed_report(rpt_handle)
 
-    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send)
+    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send, sync_fn)
 
     assert result is True
-    # Expect three sends total: attempt 1 (cmd), attempt 2 (sync + cmd)
-    sends = [c.args[0] for c in transport_send.await_args_list]
-    assert sends == [cmd_bytes, sync_bytes, cmd_bytes], (
-        f"Send order wrong; got {sends!r}"
-    )
+    assert calls == ["cmd", "sync", "cmd"], f"Send order wrong; got {calls!r}"
 
 
-async def test_command_timeout_returns_false(rpt_handle: DeviceHandle) -> None:
-    """CommandTimeoutError from the broker → helper returns False (no raise)."""
+async def test_no_report_after_both_attempts_returns_false(rpt_handle: DeviceHandle) -> None:
+    """Neither attempt draws a report frame → False, no raise, two sends."""
     cmd_bytes = b"\xBBcmd"
     transport_send = AsyncMock()
 
-    rpt_handle.broker.send_and_wait.side_effect = CommandTimeoutError("toapp_report_data", 2)
-
-    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send)
+    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send, AsyncMock())
 
     assert result is False
+    assert transport_send.await_count == 2
 
 
-async def test_concurrent_request_falls_back_to_plain_send(rpt_handle: DeviceHandle) -> None:
-    """When another verified RPT_START is in flight, the helper:
-    1. Catches ConcurrentRequestError silently
-    2. Falls back to a fire-and-forget send of cmd_bytes
-    3. Returns False (we can't claim verification)
-    """
+async def test_sync_failure_does_not_abort_retry(rpt_handle: DeviceHandle) -> None:
+    """A flaky re-sync must not block the retry send itself."""
     cmd_bytes = b"\xBBcmd"
-    transport_send = AsyncMock()
+    sync_fn = AsyncMock(side_effect=RuntimeError("flaky sync write"))
 
-    rpt_handle.broker.send_and_wait.side_effect = ConcurrentRequestError("Already waiting")
+    async def transport_send(_payload: bytes) -> None:
+        if send_spy.await_count == 2:
+            _feed_report(rpt_handle)
 
-    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send)
+    send_spy = AsyncMock(side_effect=transport_send)
 
-    assert result is False
-    # Fallback fire-and-forget send did happen
-    transport_send.assert_awaited_once_with(cmd_bytes)
-
-
-async def test_retry_prefix_send_failure_does_not_abort(rpt_handle: DeviceHandle) -> None:
-    """If the ble_sync prefix send itself raises, the helper logs DEBUG and
-    still re-issues the RPT_START on that attempt — a flaky sync write must
-    not block the actual retry."""
-    cmd_bytes = b"\xBBcmd"
-    sync_bytes = b"\xAAsync"
-    rpt_handle.commands.send_todev_ble_sync.return_value = sync_bytes
-
-    # First send (attempt 1, cmd): ok.  Second send (attempt 2, ble_sync prefix): raises.
-    # Third send (attempt 2, cmd after the failed prefix): ok.
-    transport_send = AsyncMock(
-        side_effect=[None, RuntimeError("flaky sync write"), None],
-    )
-
-    async def _drive(send_fn, expected_field, **kwargs) -> None:
-        await send_fn()  # attempt 1
-        await send_fn()  # attempt 2 (prefix raises, cmd should still go)
-
-    rpt_handle.broker.send_and_wait.side_effect = _drive
-
-    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send)
+    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, send_spy, sync_fn)
 
     assert result is True
-    sends = [c.args[0] for c in transport_send.await_args_list]
-    assert sends == [cmd_bytes, sync_bytes, cmd_bytes]
+    assert send_spy.await_count == 2
+
+
+async def test_defaults_to_quota_free_force_sync(rpt_handle: DeviceHandle, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting sync_fn routes the retry nudge through _force_sync, not a quota-counted send.
+
+    Regression guard for the original bug: the nudge used to go out via ``send_raw``,
+    charging the cloud send quota for what is a keep-alive.
+    """
+    forced = AsyncMock()
+    monkeypatch.setattr(DeviceHandle, "_force_sync", forced)
+    transport_send = AsyncMock()
+
+    result = await rpt_handle._send_rpt_start_verified(b"\xBBcmd", transport_send)
+
+    assert result is False
+    forced.assert_awaited_once()
+
+
+async def test_frame_already_in_flight_counts(rpt_handle: DeviceHandle) -> None:
+    """A report landing concurrently with the send resolves the wait.
+
+    The broker-key approach missed these: a frame that arrived microseconds before the
+    request was registered did not resolve it, so a healthily-streaming device still ate
+    a redundant retry.
+    """
+    cmd_bytes = b"\xBBcmd"
+
+    async def transport_send(_payload: bytes) -> None:
+        asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
+
+    result = await rpt_handle._send_rpt_start_verified(cmd_bytes, AsyncMock(side_effect=transport_send), AsyncMock())
+
+    assert result is True
 
 
 # ===========================================================================
@@ -1243,6 +1254,8 @@ def _make_transport(transport_type: TransportType, *, connected: bool = True) ->
     t.transport_type = transport_type
     t.is_connected = connected
     t.is_rate_limited = False
+    t.is_send_blocked = MagicMock(return_value=False)
+    t.seconds_until_send_available = MagicMock(return_value=0.0)
     t.last_send_monotonic = 0.0
     t.send = AsyncMock()
     t.send_heartbeat = AsyncMock()
@@ -1831,3 +1844,58 @@ async def test_device_unbound_hook_fires_only_once() -> None:
     await asyncio.sleep(0)
 
     hook.assert_awaited_once_with(handle)
+
+
+# ---------------------------------------------------------------------------
+# Firmware exemption — is_send_blocked must agree at every layer
+# (regression: _send_marked used to check is_rate_limited without the firmware
+# exemption that transport.send() applies, permanently blocking all commands
+# and sagas for quota-free-firmware devices once the window filled or a 429
+# set the ban — while telemetry kept flowing.)
+# ---------------------------------------------------------------------------
+
+
+def test_is_send_blocked_applies_firmware_exemption() -> None:
+    """is_send_blocked() must exempt firmware >= RATE_LIMIT_REMOVED_VERSION."""
+    t = _make_concrete_transport()
+    t.set_rate_limited()
+    assert t.is_rate_limited is True
+
+    # Pre-removal firmware: blocked.
+    assert t.is_send_blocked("1.11.5.0") is True
+    # Post-removal firmware (e.g. Luba Mini 2.x): exempt.
+    assert t.is_send_blocked("2.3.27.16") is False
+    # Unknown / unparseable version: fail closed (blocked).
+    assert t.is_send_blocked("") is True
+
+    # Not rate-limited at all: never blocked, regardless of firmware.
+    t._rate_limited_until = time.monotonic() - 1  # noqa: SLF001
+    assert t.is_send_blocked("1.11.5.0") is False
+
+
+async def test_send_marked_allows_exempt_firmware_while_rate_limited() -> None:
+    """_send_marked() must send when the transport exempts this firmware.
+
+    The pre-check must use the same is_send_blocked predicate as
+    transport.send() — it must never block a send the transport would allow.
+    """
+    handle = _make_rl_handle()
+    mqtt = _make_mqtt_transport()
+    mqtt.is_rate_limited = True  # quota/ban active...
+    mqtt.is_send_blocked = MagicMock(return_value=False)  # ...but firmware is exempt
+    handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
+
+    await handle._send_marked(mqtt, b"\x01\x02\x03")  # noqa: SLF001
+
+    mqtt.send.assert_awaited_once()
+
+
+async def test_send_marked_passes_firmware_version_to_is_send_blocked() -> None:
+    """The pre-check must consult is_send_blocked with the handle's firmware version."""
+    handle = _make_rl_handle()
+    mqtt = _make_mqtt_transport()
+    handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
+
+    await handle._send_marked(mqtt, b"\x01")  # noqa: SLF001
+
+    mqtt.is_send_blocked.assert_called_once_with(handle.firmware_version)

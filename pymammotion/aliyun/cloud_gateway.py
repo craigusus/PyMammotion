@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import hashlib
 import hmac
 import itertools
 import json
 from json.decoder import JSONDecodeError
 from logging import getLogger
-import random
+import secrets
 import string
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import uuid
 
 from aiohttp import ClientSession, ConnectionTimeoutError
@@ -24,6 +23,9 @@ from alibabacloud_tea_util.models import RuntimeOptions
 
 from pymammotion.aliyun.client import Client
 from pymammotion.aliyun.exceptions import (
+    DEVICE_OFFLINE_CODES,
+    DEVICE_UNBOUND_CODES,
+    GATEWAY_TIMEOUT_CODES,
     AuthRefreshException,
     CloudSetupError,
     DeviceOfflineException,
@@ -42,11 +44,13 @@ from pymammotion.aliyun.model.session_by_authcode_response import SessionByAuthC
 from pymammotion.aliyun.model.thing_response import ThingPropertiesResponse
 from pymammotion.aliyun.regions import region_mappings
 from pymammotion.const import ALIYUN_DOMAIN, APP_KEY, APP_SECRET, APP_VERSION
-from pymammotion.http.http import MammotionHTTP
-from pymammotion.http.model.http import DeviceInfo, DeviceRecords, LoginResponseData, Response
-from pymammotion.http.model.response_factory import response_factory
 from pymammotion.transport.base import SessionExpiredError, TransportType
 from pymammotion.utility.datatype_converter import DatatypeConverter
+
+if TYPE_CHECKING:
+    # The gateway no longer builds a login session — it is handed one — so this is
+    # a type-only dependency now.
+    from pymammotion.http.http import MammotionHTTP
 
 logger = getLogger(__name__)
 
@@ -145,7 +149,7 @@ class CloudIOTGateway:
     def generate_random_string(length: int) -> str:
         """Generate a random string of specified length."""
         characters = string.ascii_letters + string.digits
-        return "".join(random.choice(characters) for _ in range(length))
+        return "".join(secrets.choice(characters) for _ in range(length))
 
     @staticmethod
     def generate_hardware_string(length: int, seed: str = "") -> str:
@@ -157,7 +161,7 @@ class CloudIOTGateway:
         identity unique; sharing one identity across accounts triggers Aliyun's
         single-connection-per-device eviction and an endless reconnect loop.
         """
-        hashed_uuid = hashlib.sha1(f"{uuid.getnode()}{seed}".encode()).hexdigest()
+        hashed_uuid = hashlib.sha1(f"{uuid.getnode()}{seed}".encode(), usedforsecurity=False).hexdigest()
         return "".join(itertools.islice(itertools.cycle(hashed_uuid), length))
 
     @staticmethod
@@ -632,10 +636,11 @@ class CloudIOTGateway:
             response_body_dict = self.parse_json_response(response_body_str)
 
             if response_body_dict.get("code") == 2401:
-                # Best-effort: a network failure inside sign_out must not mask the
-                # 2401 — TokenManager keys its recovery path off SessionExpiredError.
-                with contextlib.suppress(Exception):
-                    await self.sign_out()
+                # Do NOT sign out here.  TokenManager recovers from a 2401 by
+                # rebuilding the IoT session from the still-valid HTTP login
+                # (connect_iot); invalidating the session first only removes state
+                # that recovery might have reused, and destroys a possibly-working
+                # session before we know the replacement can be established.
                 raise SessionExpiredError(
                     TransportType.CLOUD_ALIYUN, "Error check or refresh token: " + response_body_dict.__str__()
                 )
@@ -854,7 +859,7 @@ class CloudIOTGateway:
         return ShareNoticeListResponse.from_dict(response_body_dict)
 
     async def send_cloud_command(self, iot_id: str, command: bytes) -> str:
-        """Sends a cloud command to a specified IoT device.
+        """Send a cloud command to a specified IoT device.
 
         This function checks if the IoT token is expired and attempts to refresh it if
         possible. It then constructs a request using the provided command and sends it
@@ -950,11 +955,11 @@ class CloudIOTGateway:
         response_body_dict = self.parse_json_response(response_body_str)
 
         if int(response_body_dict.get("code") or 0) != 200:
-            if response_body_dict.get("code") == 6205:
-                logger.debug("Device offline (6205): %s", iot_id)
+            if response_body_dict.get("code") in DEVICE_OFFLINE_CODES:
+                logger.debug("Device offline (%s): %s", response_body_dict.get("code"), iot_id)
                 raise DeviceOfflineException(response_body_dict.get("code"), iot_id)
-            if response_body_dict.get("code") == 29004:
-                logger.warning("Device unbound from Aliyun (29004): %s", iot_id)
+            if response_body_dict.get("code") in DEVICE_UNBOUND_CODES:
+                logger.warning("Device unbound from Aliyun (%s): %s", response_body_dict.get("code"), iot_id)
                 raise DeviceUnboundException(response_body_dict.get("code"), iot_id)
             # 29003 and 460 are expected auth-expiry codes handled by the caller — log at debug.
             # Everything else is unexpected and logged at warning.
@@ -972,7 +977,7 @@ class CloudIOTGateway:
             if response_body_dict.get("code") == 22000:
                 logger.error(response.body)
                 raise FailedRequestException(iot_id)
-            if response_body_dict.get("code") == 20056:
+            if response_body_dict.get("code") in GATEWAY_TIMEOUT_CODES:
                 logger.debug("Gateway timeout.")
                 raise GatewayTimeoutException(response_body_dict.get("code"), iot_id)
 
@@ -1160,21 +1165,22 @@ class CloudIOTGateway:
     async def from_cache(
         cls,
         data: dict[str, Any],
-        account: str,
-        password: str,
-        ha_version: str | None = None,
+        mammotion_http: MammotionHTTP,
     ) -> CloudIOTGateway | None:
         """Reconstruct a CloudIOTGateway from a previously serialized cache dictionary.
 
-        Returns None if any required field is missing or if an error occurs during
-        reconstruction or session refresh.
+        Restores the Aliyun half of the cache only.  The HTTP login it hangs off is
+        the caller's: it has already been restored (:meth:`MammotionHTTP.from_cache`)
+        and validated, so an account has exactly one login session no matter how many
+        transports are restored from the same cache.
+
+        Returns None if any required Aliyun field is missing or if an error occurs
+        during reconstruction or session refresh — the login itself survives, and only
+        this transport is given up.
 
         Args:
             data: Cache dictionary previously produced by :meth:`to_cache`.
-            account: User account (email / username) for the MammotionHTTP instance.
-            password: User password for the MammotionHTTP instance.
-            ha_version: Optional Home Assistant integration version forwarded to
-                the inner MammotionHTTP for the ``App-Version`` header.
+            mammotion_http: The account's restored, validated login session.
 
         """
         required_keys = (
@@ -1184,7 +1190,6 @@ class CloudIOTGateway:
             "aep_data",
             "session_data",
             "device_data",
-            "mammotion_data",
         )
         if any(k not in data for k in required_keys):
             return None
@@ -1195,42 +1200,9 @@ class CloudIOTGateway:
         aep_data = data["aep_data"]
         session_data = data["session_data"]
         device_data = data["device_data"]
-        mammotion_data = data["mammotion_data"]
-        mammotion_device_list = data.get("mammotion_device_list")
-        mammotion_device_records = data.get("mammotion_device_records")
 
-        if any(
-            v is None
-            for v in [connect_data, auth_data, region_data, aep_data, session_data, device_data, mammotion_data]
-        ):
+        if any(v is None for v in [connect_data, auth_data, region_data, aep_data, session_data, device_data]):
             return None
-
-        mammotion_response_data: Response[LoginResponseData] = (
-            response_factory(Response[LoginResponseData], mammotion_data)
-            if isinstance(mammotion_data, dict)
-            else mammotion_data
-        )
-
-        mammotion_http = MammotionHTTP(account, password, ha_version=ha_version)
-        mammotion_http.response = mammotion_response_data
-        if mammotion_device_list:
-            mammotion_http.device_info = (
-                [DeviceInfo.from_dict(d) if isinstance(d, dict) else d for d in mammotion_device_list]
-                if isinstance(mammotion_device_list, list)
-                else mammotion_device_list
-            )
-        if mammotion_device_records:
-            mammotion_http.device_records = (
-                DeviceRecords.from_dict(mammotion_device_records)
-                if isinstance(mammotion_device_records, dict)
-                else mammotion_device_records
-            )
-
-        mammotion_http.login_info = (
-            LoginResponseData.from_dict(mammotion_response_data.data)
-            if isinstance(mammotion_response_data.data, dict)
-            else mammotion_response_data.data
-        )
 
         try:
             cloud_client = cls(

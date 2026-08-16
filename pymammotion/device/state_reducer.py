@@ -61,6 +61,7 @@ from pymammotion.proto import (
     DrvKnifeChangeReport,
     DrvSrSpeed,
     DrvUpgradeReport,
+    DrvWifiMsg,
     Getlamprsp,
     GetMnetInfoRsp,
     GetNetworkInfoRsp,
@@ -84,6 +85,7 @@ from pymammotion.proto import (
     ReportInfoData,
     ReportInfoT,
     ResponseBasestationInfoT,
+    ResponseSetModeT,
     SvgMessageAckT,
     SysCommCmd,
     SystemUpdateBufMsg,
@@ -151,7 +153,7 @@ class MowerStateReducer(StateReducer):
     monolithic StateReducer.
     """
 
-    def apply(self, current: MowingDevice, message: LubaMsg) -> MowingDevice:  # type: ignore
+    def apply(self, current: MowingDevice, message: LubaMsg) -> MowingDevice:  # type: ignore  # noqa: C901
         """Apply a decoded LubaMsg to the current state, return updated state.
 
         Uses selective deep-copying: only the sub-trees that a given message type
@@ -281,7 +283,11 @@ class MowerStateReducer(StateReducer):
                         device.mower_state = copy.deepcopy(current.mower_state)
                         device.device_firmwares = copy.deepcopy(current.device_firmwares)
                     case "toapp_upgrade_report":
+                        # apply_ota_progress mutates events + update_check, and
+                        # device_firmwares on the completion frame.
                         device.events = copy.deepcopy(current.events)
+                        device.update_check = copy.deepcopy(current.update_check)
+                        device.device_firmwares = copy.deepcopy(current.device_firmwares)
                     case "toapp_mnet_info_rsp":
                         device.report_data = copy.deepcopy(current.report_data)
                     case _:
@@ -310,7 +316,39 @@ class MowerStateReducer(StateReducer):
     # without the callback invocations.
     # ------------------------------------------------------------------
 
-    def _update_nav_data(self, device: MowingDevice, message: LubaMsg) -> None:
+    @staticmethod
+    def _fallback_area_names(device: MowingDevice) -> list[AreaHashNameList]:
+        """Name every area in ``device.map.area`` when the device sent no hash names.
+
+        Prefers the frame's ``name_time.name``, then any label the area already
+        carries, and only then mints ``area N`` from the lowest free number.
+
+        A minted label must be stable for the life of the area: consumers bake it
+        into a durable identity (Home Assistant derives the area switch's entity_id
+        from it, fixed at registration).  Numbering by position in
+        ``sorted(map.area)`` renumbered every area above a newly-arrived hash, so
+        areas present during a map sync ended up permanently labelled from "area 4"
+        once the transient extras were pruned.
+        """
+        named = {a.hash: a.name for a in device.map.area_name if a.name}
+        used = {
+            int(name.split()[-1])
+            for name in named.values()
+            if name.lower().startswith("area ") and name.split()[-1].isdigit()
+        }
+        next_n = 1
+        area_names: list[AreaHashNameList] = []
+        for hash_id in sorted(device.map.area.keys()):
+            name = named.get(hash_id) or device.map.area[hash_id].name
+            if not name:
+                while next_n in used:
+                    next_n += 1
+                used.add(next_n)
+                name = f"area {next_n}"
+            area_names.append(AreaHashNameList(name=name, hash=hash_id))
+        return area_names
+
+    def _update_nav_data(self, device: MowingDevice, message: LubaMsg) -> None:  # noqa: C901
         """Update navigation data fields on *device* in-place."""
         # Pool cleaners (Spino) reuse the LubaMsg envelope but do not have a
         # GNSS RTK origin or a lat/lon dock. Generating GeoJSON from a (0,0)
@@ -377,20 +415,17 @@ class MowerStateReducer(StateReducer):
                 # would empty find_incomplete_hashes and stop step 4 early, leaving
                 # area geometry unfetched.  The saga handles staleness at its start.
                 if not self._is_saga_active():
-                    bol_hash = device.report_data.locations[0].bol_hash if device.report_data.locations else 0
-                    if bol_hash:
-                        device.map.invalidate_maps(bol_hash)
+                    # None when no report frame has arrived yet — invalidate_maps
+                    # treats that as "unknown" and leaves the manifest alone.  A
+                    # reported 0 is passed through: it means the device has no areas.
+                    locs = device.report_data.locations
+                    device.map.invalidate_maps(locs[0].bol_hash if locs else None)
                 if hash_names.hashnames:
                     device.map.area_name = [
                         AreaHashNameList(name=item.name, hash=item.hash) for item in hash_names.hashnames
                     ]
                 elif device.map.area:
-                    # Device returned no names — prefer name_time.name from the area
-                    # frames if present, falling back to numbered labels.
-                    device.map.area_name = [
-                        AreaHashNameList(name=device.map.area[h].name or f"area {i + 1}", hash=h)
-                        for i, h in enumerate(sorted(device.map.area.keys()))
-                    ]
+                    device.map.area_name = self._fallback_area_names(device)
                 # else: no areas fetched yet — leave area_name alone; HashList.update()
                 # will generate fallback names as each area chunk arrives.
             case "toapp_map_name_msg":
@@ -590,13 +625,9 @@ class MowerStateReducer(StateReducer):
 
             case "toapp_upgrade_report":
                 upgrade_report: DrvUpgradeReport = net_msg[1]  # type: ignore
-                device.events.ota_progress.devname = upgrade_report.devname
-                device.events.ota_progress.otaid = upgrade_report.otaid
-                device.events.ota_progress.version = upgrade_report.version
-                device.events.ota_progress.progress = upgrade_report.progress
-                device.events.ota_progress.result = upgrade_report.result
-                device.events.ota_progress.message = upgrade_report.message
-                device.events.ota_progress.recv_cnt = upgrade_report.recv_cnt
+                # Folds into both events.ota_progress (full frame) and update_check
+                # (what progress displays read) — see Device.apply_ota_progress.
+                device.apply_ota_progress(upgrade_report)
             case "toapp_mnet_info_rsp":
                 mnet_info_rsp: GetMnetInfoRsp = net_msg[1]  # type: ignore
                 if mnet_info_rsp.mnet is not None:
@@ -656,7 +687,7 @@ class MowerStateReducer(StateReducer):
                     device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright
                     device.mower_state.lamp_info.night_light = lamp_resp.lamp_ctrl == LampCtrlSta.power_ctrl_on
 
-    def apply_properties(self, current: MowingDevice, properties: ThingPropertiesMessage) -> MowingDevice:  # type: ignore
+    def apply_properties(self, current: MowingDevice, properties: ThingPropertiesMessage) -> MowingDevice:  # type: ignore  # noqa: C901
         """Extract mower state from a thing/properties JSON push.
 
         Mirrors the mapping in :meth:`MowerDevice.update_device_firmwares` for
@@ -772,9 +803,12 @@ class MowerStateReducer(StateReducer):
         device.report_data = copy.deepcopy(current.report_data)
         p = properties.params
 
-        device.report_data.dev.battery_val = p.battery_percentage
-        device.report_data.dev.sys_status = p.device_state
-        device.report_data.work.knife_height = p.knife_height
+        if p.battery_percentage is not None:
+            device.report_data.dev.battery_val = p.battery_percentage
+        if p.device_state is not None:
+            device.report_data.dev.sys_status = p.device_state
+        if p.knife_height is not None:
+            device.report_data.work.knife_height = p.knife_height
         if p.device_version:
             device.device_firmwares.device_version = p.device_version
         if p.lora_general_config:
@@ -892,16 +926,21 @@ class PoolStateReducer(StateReducer):
     - ``sys.report_info`` → :class:`ReportInfoT` → :class:`DevStatueT` —
       runtime status (sys_status, work_mode, battery, …) shown on the home
       screen.
+    - ``sys.response_set_mode`` → :class:`ResponseSetModeT` — ack for
+      ``set_work_mode``, and the only source of the session start/end times.
     - ``sys.app_downlink_cmd`` → :class:`AppDownlinkCmdT` — both the
       outgoing user-settings commands (wall material, bottom type, floor
       speed) and the device's ack responses that carry pool ``map_info`` /
       ``line_info`` geometry rendered by ``SwimmingMapActivity``.
 
-    Other LubaMsg sub-message groups (``nav``, ``driver``, ``base``) are
-    not used by Spino in any path the app reads, so they are intentionally
-    no-ops here. Net / mul / ota will be added once their Spino usage is
-    confirmed against captured traffic — leaving them out is safer than
-    reusing mower dispatch on a device that has no ``mower_state``.
+    - ``sys.toapp_dev_fw_info`` → firmware version + module versions.
+    - ``net.toapp_wifi_iot_status`` / ``net.toapp_WifiMsg`` → connectivity,
+      product key, SSID/IP.  The Wi-Fi password carried by ``toapp_WifiMsg``
+      is never stored.
+
+    Other LubaMsg sub-message groups (``nav``, ``driver``, ``base``, ``mul``,
+    ``ota``) are not used by Spino in any path the app reads, so they are
+    intentionally no-ops here.
     """
 
     def apply(self, current: PoolCleanerDevice, message: LubaMsg) -> PoolCleanerDevice:  # type: ignore
@@ -918,8 +957,12 @@ class PoolStateReducer(StateReducer):
             if message.ctrl is not None and message.ctrl.plan_job_set is not None:
                 self._update_plan_job_set(device, message.ctrl.plan_job_set)
             return device
+        if sub_msg_type == "net":
+            device.pool_state = copy.deepcopy(current.pool_state)
+            self._update_net(device, message)
+            return device
         if sub_msg_type != "sys":
-            # Only the sys + ctrl envelopes carry Spino payloads we currently model.
+            # Only the sys + ctrl + net envelopes carry Spino payloads we currently model.
             return device
 
         sys_msg = betterproto2.which_one_of(message.sys, "SubSysMsg")  # type: ignore
@@ -927,6 +970,9 @@ class PoolStateReducer(StateReducer):
             case "report_info":
                 device.pool_state = copy.deepcopy(current.pool_state)
                 self._update_report_info(device, sys_msg[1])  # type: ignore
+            case "response_set_mode":
+                device.pool_state = copy.deepcopy(current.pool_state)
+                self._update_response_set_mode(device, sys_msg[1])  # type: ignore
             case "app_downlink_cmd":
                 device.pool_state = copy.deepcopy(current.pool_state)
                 device.pool_map = copy.deepcopy(current.pool_map)
@@ -937,6 +983,11 @@ class PoolStateReducer(StateReducer):
             case "system_update_buf":
                 device.pool_state = copy.deepcopy(current.pool_state)
                 self._update_system_update_buf(device, sys_msg[1])  # type: ignore
+            case "toapp_dev_fw_info":
+                device.device_firmwares = copy.deepcopy(current.device_firmwares)
+                self._update_fw_info(device, sys_msg[1])  # type: ignore
+            case "todev_data_time":
+                pass  # device RTC broadcast — nothing to model
             case _:
                 _logger.debug(
                     "PoolStateReducer: ignoring unhandled sys sub-message %r for %s",
@@ -957,6 +1008,30 @@ class PoolStateReducer(StateReducer):
         device.pool_state.sys_status = SpinoSysStatus(status.sys_status)
         device.pool_state.work_mode = SpinoWorkMode(status.work_mode)
         device.pool_state.battery = status.bat_val
+        device.pool_state.charging = bool(status.charge_status)
+        device.pool_state.wifi_rssi = status.wifi_rssi
+        device.pool_state.ble_rssi = status.ble_rssi
+        device.pool_state.wifi_connected = bool(status.wifi_connect_status)
+        device.pool_state.iot_connected = bool(status.iot_connect_status)
+
+    def _update_response_set_mode(self, device: PoolCleanerDevice, resp: ResponseSetModeT) -> None:
+        """Apply the device's ack for a ``set_work_mode`` command.
+
+        The Spino answers every mode switch with ``response_set_mode`` (msgattr
+        ``MSG_ATTR_RESP``) ~200-300 ms ahead of the matching ``report_info``, and it
+        is the only message that carries the cleaning-session timestamps.
+
+        ``statue`` is a message discriminant rather than a result code — the APK
+        reuses ``response_set_mode`` in the app→device direction with ``statue=2``
+        to request job history (``requestSwimmingJobHistory``), so only the ack
+        form (0) is applied here.  ``cur_work_mode`` is what the device actually
+        switched to; ``set_work_mode`` merely echoes the request.
+        """
+        if resp.statue != 0:
+            return
+        device.pool_state.work_mode = SpinoWorkMode(resp.cur_work_mode)
+        device.pool_state.start_work_time = resp.start_work_time
+        device.pool_state.end_work_time = resp.end_work_time
 
     def _update_toggle(self, device: PoolCleanerDevice, cmd: SysCommCmd) -> None:
         """Apply a ``SysCommCmd`` (``allpowerfullRW``) read/ack to a pool toggle.
@@ -1069,7 +1144,7 @@ class PoolStateReducer(StateReducer):
                 device.name,
             )
             return
-        device.pool_state.error_count = int(data[2])
+        device.pool_state.error_count = max(0, int(data[2]))
         entries: list[SpinoErrorEntry] = []
         i = 3
         while i + 1 < len(data):
@@ -1079,6 +1154,37 @@ class PoolStateReducer(StateReducer):
                 entries.append(SpinoErrorEntry(code=code, timestamp=stamp))
             i += 2
         device.pool_state.error_log = entries
+
+    def _update_fw_info(self, device: PoolCleanerDevice, fw_info: DeviceFwInfo) -> None:
+        """Apply a ``toapp_dev_fw_info`` response to *device*."""
+        if fw_info.result == 0:
+            return
+        device.device_firmwares.device_version = fw_info.version
+        device.update_device_firmwares(fw_info)
+
+    def _update_net(self, device: PoolCleanerDevice, message: LubaMsg) -> None:
+        """Apply net sub-messages (connectivity info) to *device*."""
+        net_msg = betterproto2.which_one_of(message.net, "NetSubType")  # type: ignore
+        match net_msg[0]:
+            case "toapp_wifi_iot_status":
+                wifi_iot: WifiIotStatusReport = net_msg[1]  # type: ignore
+                device.pool_state.wifi_connected = wifi_iot.wifi_connected
+                device.pool_state.iot_connected = wifi_iot.iot_connected
+                if wifi_iot.productkey:
+                    device.product_key = wifi_iot.productkey
+            case "toapp_WifiMsg":
+                # Never store wifi.password — plaintext Wi-Fi credentials on the wire.
+                wifi: DrvWifiMsg = net_msg[1]  # type: ignore
+                device.wifi_ssid = wifi.msgssid
+                device.ip = wifi.ip
+                device.wifi_enabled = wifi.wifi_enable
+                device.pool_state.wifi_rssi = wifi.rssi
+            case _:
+                _logger.debug(
+                    "PoolStateReducer: ignoring net sub-message %r for %s",
+                    net_msg[0],
+                    device.name,
+                )
 
     def _update_plan_job_set(self, device: PoolCleanerDevice, wire: PlanJobSet) -> None:
         """Upsert a Spino plan into ``device.plans`` from a wire ``PlanJobSet``.
@@ -1208,6 +1314,20 @@ class RTKStateReducer(StateReducer):
                 device.ip = net_info.ip
                 device.mask = net_info.mask
                 device.gateway = net_info.gateway
+            case "toapp_upgrade_report":
+                # Base stations stream the same OTA progress frames as mowers, and have
+                # their own update entity.  RTKBaseStationDevice has no `events`, so
+                # apply_ota_progress updates update_check only — which is all a progress
+                # display reads.
+                #
+                # apply() builds `device` with a shallow dataclasses.replace, so unlike
+                # this reducer's other cases (which assign scalars) we must copy the
+                # nested models before mutating them in place — otherwise the write lands
+                # on the previous snapshot too.
+                rtk_upgrade_report: DrvUpgradeReport = net_msg[1]  # type: ignore
+                device.update_check = copy.deepcopy(device.update_check)
+                device.device_firmwares = copy.deepcopy(device.device_firmwares)
+                device.apply_ota_progress(rtk_upgrade_report)
             case _:
                 _logger.debug(
                     "RTKStateReducer: ignoring net sub-message %r for %s",

@@ -415,6 +415,10 @@ class HashList(DataClassORJSONMixin):
     generated_mow_path_geojson: dict[str, Any] = field(default_factory=dict)
     last_ub_path_hash: int = 0
     plans_stale: bool = False
+    #: Set once a PlanFetchSaga completes, so an empty ``plan`` can be told apart
+    #: from one never fetched.  Re-fetches are driven by ``plans_stale`` and by
+    #: ``init_cfg_hash`` changes from there, not by a timer.
+    plans_fetched: bool = False
     edge_points: dict[int, EdgePoints] = field(default_factory=dict)  # hash → EdgePoints
     dynamics_line: list[CommDataCouple] = field(default_factory=list)
     """Assembled live mow-progress path from the latest type=18 fetch.
@@ -470,7 +474,9 @@ class HashList(DataClassORJSONMixin):
         """Drop entries from every per-type dict whose hash isn't in *hashlist*."""
         if not hashlist:
             return
-        if bol_hash and bol_hash != 0:
+        # None = caller didn't supply one, so there is nothing to judge staleness
+        # against.  A supplied 0 is forwarded: it means "device has no areas".
+        if bol_hash is not None:
             self.invalidate_maps(bol_hash)
         self.area = {hash_id: frames for hash_id, frames in self.area.items() if hash_id in hashlist}
         self.path = {hash_id: frames for hash_id, frames in self.path.items() if hash_id in hashlist}
@@ -567,10 +573,14 @@ class HashList(DataClassORJSONMixin):
         # O(A²) next()/comprehension-per-area pattern.
         area_name_list: list[AreaHashNameList] = [AreaHashNameList(name=a.name, hash=a.hash) for a in self.area_name]
         by_hash: dict[int, AreaHashNameList] = {a.hash: a for a in area_name_list}
+        # Only a name belonging to a live area reserves its number.  ``update_hash_lists``
+        # deliberately keeps orphaned ``area_name`` entries (hash no longer in ``self.area``),
+        # so any map edit leaves the pre-edit fallback names behind — counting those would
+        # renumber every surviving area past them ("Area 1-3" → "Area 4-6").
         used_numbers: set[int] = {
             int(a.name.split()[-1])
             for a in area_name_list
-            if a.name.lower().startswith("area ") and a.name.split()[-1].isdigit()
+            if a.hash in self.area and a.name.lower().startswith("area ") and a.name.split()[-1].isdigit()
         }
         next_n = 1
 
@@ -1002,12 +1012,25 @@ class HashList(DataClassORJSONMixin):
         area_name_hashes = {a.hash for a in self.area_name}
         return not area_name_hashes or area_name_hashes.issubset(set(self.area_root_hashlist))
 
-    def invalidate_maps(self, bol_hash: int) -> None:
+    def invalidate_maps(self, bol_hash: int | None) -> None:
         """Trigger a map re-fetch when the device reports a new ``bol_hash``.
 
         The ``bol_hash`` reported in every ``toapp_report_data`` is a checksum
         of the current area-root hash list.  A mismatch means the map was
         edited device-side.
+
+        Pass ``None`` when the device has not reported a ``bol_hash`` yet — that
+        is *not* the same as reporting ``0``, and conflating the two costs you one
+        case or the other:
+
+        * ``None`` (unknown) must never wipe.  A ``MapFetchSaga`` started before
+          the first ``toapp_report_data`` arrives — HA restart, manual "sync
+          maps" — would otherwise drop a perfectly good cached manifest on every
+          single run and force a full re-fetch, defeating incremental resume.
+        * ``0`` is a real value meaning "the device has no areas"
+          (:meth:`computed_bol_hash` returns 0 for an empty list).  It must be
+          allowed through, or deleting every area on the device is undetectable
+          and the stale areas stay cached forever.
 
         Only ``root_hash_lists`` entries with ``sub_cmd == 0`` (areas) are
         removed so that :class:`MapFetchSaga` knows to re-request the area
@@ -1019,7 +1042,7 @@ class HashList(DataClassORJSONMixin):
         than now.  Hash IDs that remain in the new list re-use their cached
         frames and are not re-fetched.
         """
-        if not bol_hash or self.computed_bol_hash == bol_hash:
+        if bol_hash is None or self.computed_bol_hash == bol_hash:
             return
         self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != 0]
         self.update_hash_lists(self.hashlist)
