@@ -28,6 +28,7 @@ from pymammotion.const import (
     MAMMOTION_OAUTH2_CLIENT_ID,
     MAMMOTION_OAUTH2_CLIENT_SECRET,
 )
+from pymammotion.data.error_codes import table_language
 from pymammotion.http.encryption import EncryptionUtils
 from pymammotion.http.model.camera_stream import StreamSubscriptionResponse, VideoResourceResponse
 from pymammotion.http.model.http import (
@@ -45,6 +46,13 @@ from pymammotion.http.model.http import (
     ShareRecords,
     UnauthorizedExceptionError,
 )
+from pymammotion.http.model.map_backup import (
+    BackupMapCheck,
+    BackupMapItem,
+    BackupMapProgress,
+    BackupMapResult,
+    BackupProgressType,
+)
 from pymammotion.http.model.product_params import ProductParamData
 from pymammotion.http.model.response_factory import response_factory
 from pymammotion.http.model.rtk import RTK
@@ -54,7 +62,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
 T = TypeVar("T")
-_ModelT = TypeVar("_ModelT", bound=DataClassORJSONMixin)
+ModelT = TypeVar("ModelT", bound=DataClassORJSONMixin)
+#: A ``Response`` payload, which may also be a list or a bare scalar.
+_DataT = TypeVar("_DataT")
 
 #: Hard stop for the error-code walk.  The table is ~470 codes; at the smallest page
 #: size the app uses that is ten pages, so this is two orders of magnitude of slack.
@@ -81,7 +91,7 @@ _REFRESH_TIMEOUT_SEC = 30.0
 _CACHE_DECODE_ERRORS = (InvalidFieldValue, MissingField, ValueError, TypeError, AttributeError, jwt.PyJWTError)
 
 
-def _decode_cached(value: Any, model: type[_ModelT]) -> _ModelT | None:
+def _decode_cached[ModelT: DataClassORJSONMixin](value: Any, model: type[ModelT]) -> ModelT | None:
     """Return one cached field as *model*, or ``None`` when the cache does not hold one.
 
     A cache entry is either an already-decoded model (the cache never left memory) or
@@ -601,15 +611,18 @@ class MammotionHTTP:
     async def _request_device_server(
         self,
         path: str,
-        response_type: type[Response[_ModelT]],
+        response_type: type[Response[_DataT]],
         what: str,
         *,
         payload: dict[str, Any] | None = None,
-    ) -> Response[_ModelT]:
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Response[_DataT]:
         """Call a ``device-server/v1`` endpoint and parse the envelope.
 
-        ``payload`` selects the verb: a body means POST, no body means GET — the
-        product list is a GET while the error-code endpoints are POSTs.  They
+        Unless ``method`` names the verb, ``payload`` selects it: a body means POST,
+        no body means GET — the product list is a GET while the error-code endpoints
+        are POSTs.  The map-backup endpoints add a PUT and a DELETE.  They
         otherwise differ only in path and payload model, so they share this rather
         than repeating the session/header/parse dance each time.  Note the prefix:
         they live under ``device-server``, while the CSV export in
@@ -620,13 +633,12 @@ class MammotionHTTP:
             **self._headers,
             "Authorization": f"Bearer {self._require_login_info.access_token}",
             "Content-Type": "application/json",
+            **(headers or {}),
         }
+        verb = method or ("GET" if payload is None else "POST")
         async with self._client_session() as session:
-            resp = (
-                await session.get(url, headers=headers)
-                if payload is None
-                else await session.post(url, json=payload, headers=headers)
-            )
+            send = getattr(session, verb.lower())
+            resp = await (send(url, headers=headers) if payload is None else send(url, json=payload, headers=headers))
             if resp.status == HTTPStatus.UNAUTHORIZED.value:
                 raise UnauthorizedExceptionError(f"{what} rejected the access token")
             if not (resp.headers.get("Content-Type") or "").startswith("application/json"):
@@ -655,19 +667,22 @@ class MammotionHTTP:
         )
 
     @refresh_token_decorator
-    async def get_error_codes_page(self, page_number: int = 1, page_size: int = 50) -> Response[ErrorCodePage]:
-        """Fetch one page of the error-code table, translations included.
+    async def get_error_codes_page(
+        self, page_number: int = 1, page_size: int = 50, *, language: str | None = None
+    ) -> Response[ErrorCodePage]:
+        """Fetch one page of the error-code table.
 
-        Mirrors the app's own paged call.  Richer than :meth:`get_all_error_codes`'s
-        CSV export — each record carries the display hints and the product keys it
-        applies to, as well as every language — so prefer this when the caller needs
-        more than implication/solution text.
+        Mirrors the app's own paged call, which names the table's language in
+        ``Accept-Language`` rather than the body; *language* may be a BCP 47 tag such
+        as ``de-CH``.  Each record also carries the display hints and product keys the
+        CSV export of :meth:`get_all_error_codes` drops.
         """
         return await self._request_device_server(
             "/device-server/v1/code/page-lan",
             Response[ErrorCodePage],
             "error code page",
             payload={"pageNumber": page_number, "pageSize": page_size},
+            headers={"Accept-Language": table_language(language)} if language else None,
         )
 
     @refresh_token_decorator
@@ -683,13 +698,16 @@ class MammotionHTTP:
             "/device-server/v1/product/product/list", Response[list[Product]], "product list"
         )
 
-    async def get_all_error_codes_paged(self, page_size: int = 50) -> dict[str, ErrorCodeRecord]:
+    async def get_all_error_codes_paged(
+        self, page_size: int = 50, *, language: str | None = None, require_complete: bool = False
+    ) -> dict[str, ErrorCodeRecord]:
         """Page through ``/code/page-lan`` and return every record, keyed by code.
 
         Stops on the first short or empty page rather than trusting a total, because
         this API's page counters are not consistent across endpoints.  A failing page
         ends the walk and returns what was collected, so a mid-table 5xx degrades to
-        a partial table instead of nothing.
+        a partial table instead of nothing — unless *require_complete*, which returns
+        ``{}`` instead, for a caller that would persist the result as the whole table.
 
         Two guards keep a misbehaving server from looping forever: a page that adds no
         code we did not already have ends the walk (a server ignoring ``pageNumber``
@@ -699,11 +717,12 @@ class MammotionHTTP:
         """
         collected: dict[str, ErrorCodeRecord] = {}
         for page_number in range(1, _MAX_ERROR_CODE_PAGES + 1):
-            response = await self.get_error_codes_page(page_number, page_size)
+            response = await self.get_error_codes_page(page_number, page_size, language=language)
             page = response.data
-            if response.code != 0 or page is None or not page.records:
-                if response.code != 0:
-                    _LOGGER.warning("Error-code page %d failed: code=%s %s", page_number, response.code, response.msg)
+            if response.code != 0 or page is None:
+                _LOGGER.warning("Error-code page %d failed: code=%s %s", page_number, response.code, response.msg)
+                return {} if require_complete else collected
+            if not page.records:
                 return collected
             fresh = {record.code: record for record in page.records if record.code not in collected}
             collected.update(fresh)
@@ -712,7 +731,145 @@ class MammotionHTTP:
         _LOGGER.warning(
             "Error-code walk hit the %d-page cap; returning %d codes", _MAX_ERROR_CODE_PAGES, len(collected)
         )
-        return collected
+        return {} if require_complete else collected
+
+    @refresh_token_decorator
+    async def get_map_backups(self) -> Response[list[BackupMapItem]]:
+        """List the logged-in account's map backups (``GET /map/backup/list``).
+
+        Backups are per account, so ones another account made of a shared mower
+        are not returned.
+        """
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/list", Response[list[BackupMapItem]], "map backup list"
+        )
+
+    @refresh_token_decorator
+    async def get_map_backup_devices(self) -> Response[list[BackupMapItem]]:
+        """List the account's devices that can be backed up, with their backup ``deviceId``."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/backup/list",
+            Response[list[BackupMapItem]],
+            "map backup device list",
+            payload={},
+        )
+
+    @refresh_token_decorator
+    async def get_map_restore_targets(self, biz_id: str, backup_device_id: str = "") -> Response[list[BackupMapItem]]:
+        """List the devices a backup can be restored onto."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/recovery/list",
+            Response[list[BackupMapItem]],
+            "map restore target list",
+            payload={"bizId": biz_id, "backupDeviceId": backup_device_id},
+        )
+
+    @refresh_token_decorator
+    async def has_map_backup(self, device_id: str) -> Response[BackupMapCheck]:
+        """Whether *device_id* has a stored backup."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/check",
+            Response[BackupMapCheck],
+            "map backup check",
+            payload={"deviceId": device_id},
+        )
+
+    @refresh_token_decorator
+    async def device_has_map(self, device_id: str) -> Response[bool]:
+        """Whether *device_id* currently holds a map a restore would overwrite."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/has/map",
+            Response[bool],
+            "device has map",
+            payload={"deviceId": device_id},
+        )
+
+    @refresh_token_decorator
+    async def start_map_backup(self, device_id: str, name: str, correction_value: str = "") -> Response[BackupMapItem]:
+        """Ask the mower to upload its map as a new backup named *name*.
+
+        ``correction_value`` is the app's satellite-map alignment offset, kept only
+        on the phone; the app sends ``{"OffsetX":0.0,"OffsetY":0.0}`` when unset.
+        The reply's ``biz_id`` identifies the job for progress and cancel calls.
+        """
+        return await self._request_device_server(
+            "/device-server/v1/map/backup",
+            Response[BackupMapItem],
+            "map backup start",
+            payload={"deviceId": device_id, "name": name, "correctionValue": correction_value},
+        )
+
+    @refresh_token_decorator
+    async def update_map_backup(
+        self, biz_id: str, device_id: str, name: str, correction_value: str = ""
+    ) -> Response[BackupMapItem]:
+        """Overwrite the existing backup *biz_id* with the mower's current map."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup",
+            Response[BackupMapItem],
+            "map backup update",
+            payload={"bizId": biz_id, "deviceId": device_id, "name": name, "correctionValue": correction_value},
+            method="PUT",
+        )
+
+    @refresh_token_decorator
+    async def restore_map_backup(self, device_id: str, biz_id: str) -> Response[BackupMapResult]:
+        """Ask *device_id* to download and apply backup *biz_id*; the mower restarts after."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/recovery",
+            Response[BackupMapResult],
+            "map restore start",
+            payload={"deviceId": device_id, "bizId": biz_id},
+        )
+
+    @refresh_token_decorator
+    async def get_map_backup_progress(
+        self, biz_id: str, progress_type: BackupProgressType
+    ) -> Response[BackupMapProgress]:
+        """Poll a backup or restore job; the app otherwise gets this pushed over SSE."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/progress",
+            Response[BackupMapProgress],
+            "map backup progress",
+            payload={"bizId": biz_id, "type": int(progress_type)},
+        )
+
+    @refresh_token_decorator
+    async def cancel_map_backup(self, device_id: str, biz_id: str) -> Response[bool]:
+        """Cancel a running backup upload."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/cancel/backup",
+            Response[bool],
+            "map backup cancel",
+            payload={"deviceId": device_id, "bizId": biz_id},
+        )
+
+    @refresh_token_decorator
+    async def cancel_map_restore(self, device_id: str, biz_id: str) -> Response[bool]:
+        """Cancel a running restore download."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/cancel/recovery",
+            Response[bool],
+            "map restore cancel",
+            payload={"deviceId": device_id, "bizId": biz_id},
+        )
+
+    @refresh_token_decorator
+    async def rename_map_backup(self, biz_id: str, name: str) -> Response[bool]:
+        """Rename a stored backup."""
+        return await self._request_device_server(
+            "/device-server/v1/map/backup/rename",
+            Response[bool],
+            "map backup rename",
+            payload={"bizId": biz_id, "name": name},
+        )
+
+    @refresh_token_decorator
+    async def delete_map_backup(self, biz_id: str) -> Response[bool]:
+        """Delete a stored backup."""
+        return await self._request_device_server(
+            f"/device-server/v1/map/backup/{biz_id}", Response[bool], "map backup delete", method="DELETE"
+        )
 
     @refresh_token_decorator
     async def refresh_authorization_token(self) -> Response:
