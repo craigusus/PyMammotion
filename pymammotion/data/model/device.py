@@ -16,7 +16,8 @@ from pymammotion.data.model.device_info import DeviceFirmwares, DeviceNonWorking
 from pymammotion.data.model.device_limits import DeviceLimits
 from pymammotion.data.model.enums import TaskAreaStatus
 from pymammotion.data.model.errors import DeviceErrors
-from pymammotion.data.model.events import OTA_RESULT_SUCCESS, Events, OTAProgress
+from pymammotion.data.model.events import OTA_RESULT_SUCCESS, Events, OTAProgress, is_zone_hash
+from pymammotion.data.model.function_codes import FunctionCodes
 from pymammotion.data.model.location import Location
 from pymammotion.data.model.pool_state import PoolMap, PoolPlan, PoolState
 from pymammotion.data.model.report_info import BaseScore, ReportData, WorkSessionResult
@@ -66,6 +67,24 @@ class Device(DataClassORJSONMixin):
     #: (0.0 = never).  Only meaningful within one process — see
     #: :meth:`has_live_ota_push`.
     ota_progress_at: float = 0.0
+    #: Cloud ``product-version-function/list`` answer; see :meth:`supports_function_code`.
+    function_codes: FunctionCodes = field(default_factory=FunctionCodes)
+
+    @property
+    def main_firmware_version(self) -> str:
+        """The main firmware version: what the app stores as ``device_current_version_<name>``."""
+        device_firmwares = getattr(self, "device_firmwares", None)
+        if version := getattr(device_firmwares, "device_version", ""):
+            return str(version)
+        return str(getattr(self, "device_version", "") or "")
+
+    def supports_function_code(self, code: str) -> bool:
+        """Return True when the cloud lists *code* for this device's current firmware.
+
+        Mirrors ``FunctionsConfigFacade.hasFunctionCode``: a set fetched for another
+        firmware is a miss, so it answers False until the current one is fetched.
+        """
+        return self.function_codes.supports(code, self.main_firmware_version)
 
     def has_live_ota_push(self) -> bool:
         """Return True when a device-pushed OTA frame is recent enough to still be trusted.
@@ -325,14 +344,24 @@ class MowerDevice(Device):
                 for i in range(3, len(buffer_list.update_buf_data), 2):
                     area_id = buffer_list.update_buf_data[i]
 
-                    if area_id != 0:
+                aborted = 0
+                for i in range(3, len(buffer_list.update_buf_data), 2):
+                    area_id = buffer_list.update_buf_data[i]
+
+                    if is_zone_hash(area_id):
                         status = TaskAreaStatus(int(buffer_list.update_buf_data[i + 1]))
                         if status is TaskAreaStatus.ABORTED:
+                            aborted += 1
                             continue
                         task_area_map[area_id] = status
                         task_area_ids.append(area_id)
                 self.events.work_tasks_event.hash_area_map = task_area_map
                 self.events.work_tasks_event.ids = task_area_ids
+                if aborted and not task_area_ids:
+                    # Every zone aborted: the job was cancelled.  The mower may still
+                    # be heading home in a job status, so the report's no-job branch
+                    # below would not run yet — end the job's route settings here.
+                    self.work = CurrentTaskSettings()
 
     def update_report_data(self, toapp_report_data: ReportInfoData) -> None:
         """Set report data for the mower."""
@@ -373,7 +402,8 @@ class MowerDevice(Device):
             is_actively_mowing = sys_status in MOWING_ACTIVE_MODES
             if not is_actively_mowing:
                 if (toapp_report_data.work.area >> 16) == 0 and toapp_report_data.work.ub_path_hash == 0:
-                    self.work.zone_hashs = []
+                    # The job has ended; an empty ``work`` means no known job.
+                    self.work = CurrentTaskSettings()
                     self.events.work_tasks_event.hash_area_map = {}
                     self.events.work_tasks_event.ids = []
                     self.map.invalidate_breakpoint_line(0)

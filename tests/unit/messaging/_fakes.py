@@ -8,7 +8,7 @@ from unittest.mock import create_autospec
 from pymammotion.data.model.hash_list import HashList
 from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
 from pymammotion.messaging.broker import DeviceMessageBroker
-from pymammotion.proto import CoverPathPacketT, CoverPathUploadT, LubaMsg, MctlNav
+from pymammotion.proto import CoverPathPacketT, CoverPathUploadT, LubaMsg, MctlNav, NavReqCoverPath
 from tests.unit.messaging._helpers import apply_msg_to_map, comm_data_frame, hash_list_msg
 
 
@@ -19,8 +19,16 @@ class FakeHashListDevice:
     (one list of hash IDs per frame); a sub_cmd absent from it is answered with
     silence.  ``comm_types`` gives the ``type`` returned for each hash on
     ``synchronize_hash_data``.  ``get_line_info_list`` is answered with one
-    single-frame cover path per request.  Every frame is applied to ``device_map``
-    before the broker sees it, standing in for the StateReducer.
+    single-frame cover path per request, one packet per requested line, except the
+    first ``ignore_line_requests`` requests, which get silence.  Every frame is
+    applied to ``device_map`` before the broker sees it, standing in for the
+    StateReducer.
+
+    ``generate_route_information`` is answered with a ``bidire_reqconver_path``
+    confirmation carrying ``route_path_hash``; once it has been sent, hash lists
+    come from ``hash_lists_after_route`` when given, the way a device's line list
+    changes when a new route is planned.  ``events`` records the order of the
+    route request and the hash-list requests.
     """
 
     def __init__(
@@ -30,12 +38,21 @@ class FakeHashListDevice:
         hash_lists: dict[int, list[list[int]]],
         *,
         comm_types: dict[int, int] | None = None,
+        ignore_line_requests: int = 0,
+        route_path_hash: int = 1,
+        hash_lists_after_route: dict[int, list[list[int]]] | None = None,
     ) -> None:
         self._broker = broker
+        self._ignore_line_requests = ignore_line_requests
         self._map = device_map
         self._hash_lists = hash_lists
         self._comm_types = comm_types or {}
         self._streaming_sub_cmd: int | None = None
+        self._route_path_hash = route_path_hash
+        self._hash_lists_after_route = hash_lists_after_route
+        self.events: list[str] = []
+        """``"route"`` / ``"hash_list:<sub_cmd>"`` in the order the device received them."""
+        self.route_requests: list[Any] = []
         self.hash_list_acks: list[tuple[int, int, int]] = []
         """``(sub_cmd, current_frame, total_frame)`` for every get_hash_response received."""
         self.line_info_requests: list[list[int]] = []
@@ -50,6 +67,7 @@ class FakeHashListDevice:
             current_frame,
             total_frame,
         )
+        cb.generate_route_information.side_effect = lambda info: ("gen_route", info)
         cb.synchronize_hash_data.side_effect = lambda hash_num: ("sync_hash", hash_num)
         cb.get_line_info_list.side_effect = lambda hash_list, transaction_id: (
             "line_info",
@@ -62,7 +80,16 @@ class FakeHashListDevice:
         if not isinstance(cmd, tuple):
             return
         match cmd:
+            case ("gen_route", info):
+                self.events.append("route")
+                self.route_requests.append(info)
+                if self._hash_lists_after_route is not None:
+                    self._hash_lists = self._hash_lists_after_route
+                await self._deliver(
+                    LubaMsg(nav=MctlNav(bidire_reqconver_path=NavReqCoverPath(sub_cmd=0, path_hash=self._route_path_hash)))
+                )
             case ("hash_list", sub_cmd):
+                self.events.append(f"hash_list:{sub_cmd}")
                 self._streaming_sub_cmd = sub_cmd
                 await self._emit_hash_frame(sub_cmd, 1)
             case ("hash_ack", current, total):
@@ -74,7 +101,8 @@ class FakeHashListDevice:
                 await self._deliver(comm_data_frame(hash_num, type_code=self._comm_types[hash_num]))
             case ("line_info", hashes, transaction_id):
                 self.line_info_requests.append(hashes)
-                await self._deliver(_cover_path_msg(hashes[0], transaction_id))
+                if len(self.line_info_requests) > self._ignore_line_requests:
+                    await self._deliver(_cover_path_msg(hashes, transaction_id))
 
     async def _emit_hash_frame(self, sub_cmd: int, current_frame: int) -> None:
         if not (frames := self._hash_lists.get(sub_cmd)):
@@ -93,14 +121,14 @@ class FakeHashListDevice:
         await self._broker.on_message(msg)
 
 
-def _cover_path_msg(path_hash: int, transaction_id: int) -> LubaMsg:
+def _cover_path_msg(path_hashes: list[int], transaction_id: int) -> LubaMsg:
     return LubaMsg(
         nav=MctlNav(
             cover_path_upload=CoverPathUploadT(
                 total_frame=1,
                 current_frame=1,
                 transaction_id=transaction_id,
-                path_packets=[CoverPathPacketT(path_hash=path_hash)],
+                path_packets=[CoverPathPacketT(path_hash=h, path_total=1, path_cur=1) for h in path_hashes],
             )
         )
     )

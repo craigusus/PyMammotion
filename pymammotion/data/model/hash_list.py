@@ -8,13 +8,20 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
+import betterproto2
+from mashumaro import field_options
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
-from pymammotion.proto import NavGetCommDataAck, NavGetHashListAck, SvgMessageAckT
+from pymammotion.data.model.mowing_modes import PathAngleSetting
+from pymammotion.proto import NavGetCommDataAck, NavGetHashListAck, NavPlanJobSet, SvgMessageAckT
+from pymammotion.utility.device_type import DeviceType
 from pymammotion.utility.mur_mur_hash import MurMurHashUtil
 
 if TYPE_CHECKING:
     from pymammotion.data.model.location import LocationPoint
+
+#: ``todev_gethash`` sub_cmd whose list holds the current route's line hashes.
+LINE_HASH_SUB_CMD = 3
 
 
 class PathType(IntEnum):
@@ -262,13 +269,43 @@ class EdgePoints(DataClassORJSONMixin):
 #: Length of a plan's ``reserved`` buffer, as the APK builds it.
 _RESERVED_LENGTH = 8
 #: Offset the device adds to the settings bytes when it stores a plan.
-_RESERVED_ECHO_OFFSET = 10
+RESERVED_ECHO_OFFSET = 10
 #: Bytes carrying settings, which arrive with the offset applied.
 _RESERVED_ECHOED_BYTES = (0, 1, 3, 4, 5, 6)
 #: Enable flag — written raw (0/1), read back as 10/11.
 _RESERVED_ENABLE_BYTE = 2
 #: Never written by the app; always sent as 0.
 _RESERVED_UNUSED_BYTE = 7
+#: Luba 1 only: the path-angle mode, which the app reads from here rather than from field 37.
+_RESERVED_TOWARD_MODE_BYTE = 4
+#: Length of ``reserved2`` (route field 21 / plan field 41), as the app builds it.
+_RESERVED2_LENGTH = 32
+
+
+def decode_auto_change_direction(value: bool | int | list[int] | None) -> bool | None:
+    """Decode "auto-reverse mowing direction" from ``reserved2`` as the app does: byte 0, less 10 when >= 10.
+
+    So 1/11 is on and 0/10 off (``WorkingOptionView``, ``JobScheduleActivity``); anything else is not guessed at.
+    Already-decoded values pass through so a serialised model reloads as itself, and a bare int (saved by 0.9.9,
+    where ``CurrentTaskSettings`` held the settings-screen flag here) loads as not reported.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int) or not value:
+        return None
+    first = value[0]
+    match first - RESERVED_ECHO_OFFSET if first >= RESERVED_ECHO_OFFSET else first:
+        case 1:
+            return True
+        case 0:
+            return False
+        case _:
+            return None
+
+
+def encode_auto_change_direction(enabled: bool | int | None) -> list[int]:
+    """Return ``reserved2`` as the app sends it (``getReserved2``): the setting in byte 0, sent even when off."""
+    return [int(bool(enabled))] + [0] * (_RESERVED2_LENGTH - 1)
 
 
 @dataclass
@@ -313,13 +350,21 @@ class Plan(DataClassORJSONMixin):
     remained_seconds: int = 0
     toward_mode: int = 0
     toward_included_angle: int = 0
+    #: "Edge Coverage" distance (0.0 = inside the edge); an edit re-sends it, so keep the read-back value.
+    ride_boundary_distance: float = 0.0
+    #: "Auto-reverse Mowing Direction" (field 41, ``reserved2`` byte 0); None when the device reported none.
+    auto_change_direction: bool | None = field(
+        default=None, metadata=field_options(deserialize=decode_auto_change_direction)
+    )
 
     # --- enable / rename helpers -----------------------------------------
     # ``reserved`` is an 8-byte buffer the device stores alongside the plan:
     #
     #   0  path / bow order      3  job start progress    6  collect frequency
-    #   1  no-go zone laps       4  unused (written 0)    7  unused (sent 0)
+    #   1  no-go zone laps       4  Luba 1 toward_mode    7  unused (sent 0)
     #   2  enable flag           5  Yuka job config, else 8
+    #
+    # Byte 4 is written 0 on every other model.
     #
     # (``HomeStateViewModule.getReserved`` writes it;
     # ``MACarDataManager.setJobPlanDB`` reads bytes 0-2 back.)
@@ -330,6 +375,26 @@ class Plan(DataClassORJSONMixin):
     #
     # All bytes the APK writes are < 128, so latin-1 round-trips
     # losslessly between str and bytes.
+
+    @classmethod
+    def from_wire(cls, wire: NavPlanJobSet, device_name: str, product_key: str = "") -> Plan:
+        """Decode a stored plan the device returned, as the app does for *device_name*.
+
+        A Luba 1 keeps ``toward_mode`` in ``reserved[4]`` (echoed +10) and the app ignores field 37 there
+        (``JobScheduleActivity.java:1039-1050``); clamped to the defined modes, as the app does not.
+        """
+        plan = cls.from_dict(wire.to_dict(casing=betterproto2.Casing.SNAKE))
+        raw = plan.reserved.encode("latin-1")
+        if DeviceType.is_luba1(device_name, product_key) and len(raw) > 2:
+            stored = raw.ljust(_RESERVED_LENGTH, b"\x00")[_RESERVED_TOWARD_MODE_BYTE]
+            plan.toward_mode = min(max(stored - RESERVED_ECHO_OFFSET, 0), max(PathAngleSetting))
+        return plan
+
+    def week_for_send(self, device_name: str = "", product_key: str = "") -> int:
+        """Return ``week`` as the app sends it: ``weeks[0]`` on a Luba 1 (``NewWorkSettingActivity.sendSchedule``)."""
+        if DeviceType.is_luba1(device_name, product_key) and self.weeks:
+            return self.weeks[0]
+        return self.week
 
     def is_enabled(self) -> bool:
         """Return True when the plan's enable flag (``reserved[2]``) is set.
@@ -365,7 +430,7 @@ class Plan(DataClassORJSONMixin):
             raw.extend(b"\x00" * (_RESERVED_LENGTH - len(raw)))
         return raw[:_RESERVED_LENGTH]
 
-    def reserved_for_send(self) -> str:
+    def reserved_for_send(self, device_name: str = "", product_key: str = "") -> str:
         """Return ``reserved`` with the device's echo offset removed.
 
         The device adds +10 to the settings bytes when it stores a plan, so
@@ -377,19 +442,25 @@ class Plan(DataClassORJSONMixin):
         The app normalises on every write instead
         (``JobScheduleActivity.java:848-866``): subtract the offset from the
         settings bytes, write the enable flag raw, and send byte 7 as 0.
-        Bytes 4 and 7 are unused — written as 0 at creation and never decoded —
-        so whether they carry the echo does not matter; the app decrements 4
-        and zeroes 7, and this does the same.
+        Byte 7 is unused, as is byte 4 on every model but the Luba 1 — written
+        as 0 at creation and never decoded — so whether they carry the echo
+        does not matter; the app decrements 4 and zeroes 7, and this does the
+        same.
 
         Values below the offset clamp at 0 rather than wrapping.  The app never
         meets one because it only ever edits a plan it read back; a plan built
         locally has no offset to remove.
+
+        On a Luba 1 byte 4 is ``toward_mode``, written raw
+        (``WorkSettingViewModel.getReserved``).
         """
         raw = self._reserved_bytes()
         for index in _RESERVED_ECHOED_BYTES:
-            raw[index] = max(raw[index] - _RESERVED_ECHO_OFFSET, 0)
+            raw[index] = max(raw[index] - RESERVED_ECHO_OFFSET, 0)
         raw[_RESERVED_ENABLE_BYTE] = 0 if self.is_enabled() else 1
         raw[_RESERVED_UNUSED_BYTE] = 0
+        if DeviceType.is_luba1(device_name, product_key):
+            raw[_RESERVED_TOWARD_MODE_BYTE] = self.toward_mode
         return raw.decode("latin-1")
 
     def with_renamed(self, new_name: str) -> Plan:
@@ -467,6 +538,10 @@ class HashList(DataClassORJSONMixin):
     #: from one never fetched.  Re-fetches are driven by ``plans_stale`` and by
     #: ``init_cfg_hash`` changes from there, not by a timer.
     plans_fetched: bool = False
+    #: ``work.job_id`` when the last PlanFetchSaga completed (0 outside a task job;
+    #: an ad-hoc job reports 0).  A task job still unmatched after a fetch made
+    #: during it (e.g. its task was deleted) does not need fetching again.
+    plans_fetched_job_id: int = 0
     edge_points: dict[int, EdgePoints] = field(default_factory=dict)  # hash → EdgePoints
     dynamics_line: list[CommDataCouple] = field(default_factory=list)
     """Assembled live mow-progress path from the latest type=18 fetch.
@@ -781,6 +856,10 @@ class HashList(DataClassORJSONMixin):
 
         Matching is by (total_frame, sub_cmd); within a match, by current_frame.
         """
+        if hash_list.sub_cmd == LINE_HASH_SUB_CMD and hash_list.current_frame == 1:
+            # A new line list replaces the old one outright (the APK clears lineHashList on
+            # frame 1); matching on total_frame would leave a stale list alongside it.
+            self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != LINE_HASH_SUB_CMD]
         target_root_list = next(
             (
                 rhl
@@ -971,7 +1050,7 @@ class HashList(DataClassORJSONMixin):
             self.current_mow_path[transaction_id] = {}
         self.current_mow_path[transaction_id][path.current_frame] = path
 
-    def upsert_edge_frame(
+    def upsert_edge_frame(  # noqa: PLR0917
         self,
         hash_key: int,
         action: int,
@@ -1112,29 +1191,93 @@ class HashList(DataClassORJSONMixin):
         self.update_hash_lists(self.hashlist)
 
     def invalidate_mow_path(self, path_hash: int) -> None:
-        """Clear cached mow-path data once the job has ended.
+        """Clear the route (line list and cached cover paths) once the device reports none.
 
-        Only fires for ``path_hash in (0, 1)``.  Non-zero mid-job values must
+        Only fires for ``path_hash <= 1``.  Non-zero mid-job values must
         be preserved — the device advances ub_path_hash through segments during
         a mow and wiping on every change would discard live data.
         """
-        if path_hash == 0:
+        if path_hash <= 1:
+            self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != LINE_HASH_SUB_CMD]
             self.current_mow_path = {}
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
             self.last_ub_path_hash = 0
 
-    def has_mow_path_for_hash(self, path_hash: int) -> bool:
-        """Return True if cover-path data for *path_hash* is already cached.
+    def invalidate_stale_route(self, path_hash: int) -> None:
+        """Drop the stored route when it does not hash to the device's live *path_hash*.
 
-        Matches against ``path_packets[0].path_hash`` in any transaction's first
-        frame — equals ``work.path_hash`` (field 2) when the cached data is current.
+        A matching line list is kept, so the next fetch only asks for the lines still absent.
         """
-        for frames in self.current_mow_path.values():
+        if (self.current_mow_path or self.line_root_hashlist) and self.computed_path_hash != path_hash:
+            self.invalidate_mow_path(0)
+
+    @property
+    def line_root_hashlist(self) -> list[int]:
+        """Return the route's line hashes (``sub_cmd == 3``) in device order, zeros kept in place."""
+        return [
+            i
+            for root_list in self.root_hash_lists
+            if root_list.sub_cmd == LINE_HASH_SUB_CMD
+            for obj in sorted(root_list.data, key=lambda d: d.current_frame)
+            for i in obj.data_couple
+        ]
+
+    @property
+    def computed_path_hash(self) -> int:
+        """Compute the route's ``path_hash`` from the stored line hash list.
+
+        Mirrors the APK's ``HashDataManager.getDBPathHash()``: MurMur-hash of every
+        line hash in position order, zero placeholders included.  Equals the
+        device's ``report_data.work.path_hash`` when the stored list is current.
+
+        Returns 0 when no line list has been fetched yet.
+        """
+        hashes = self.line_root_hashlist
+        if not hashes:
+            return 0
+        return int(MurMurHashUtil.hash_unsigned_list(hashes))
+
+    def has_mow_path_for_hash(self, line_hash: int) -> bool:
+        """Return True if every packet of *line_hash*'s cover path is cached.
+
+        *line_hash* is one entry of the ``sub_cmd == 3`` line list (a packet's
+        ``path_hash``), not the report's ``work.path_hash`` — use
+        :meth:`is_mow_path_current` for that.  A line can span frames, so this
+        needs packets ``1..path_total``; only complete transactions count, since
+        the GeoJSON builders skip incomplete ones.
+        """
+        incomplete = self.find_missing_mow_path_frames()
+        received: set[int] = set()
+        path_total = 0
+        for transaction_id, frames in self.current_mow_path.items():
+            if transaction_id in incomplete:
+                continue
             for mow_path in frames.values():
-                if mow_path.path_packets and mow_path.path_packets[0].path_hash == path_hash:
-                    return True
-        return False
+                for packet in mow_path.path_packets:
+                    if packet.path_hash == line_hash:
+                        received.add(packet.path_cur)
+                        path_total = packet.path_total
+        if not received:
+            return False
+        return received >= set(range(1, path_total + 1))
+
+    def is_mow_path_current(self, path_hash: int) -> bool:
+        """Return True if the cached cover path is complete for the route *path_hash* identifies.
+
+        *path_hash* is the report's ``work.path_hash``.  The stored line list must
+        hash to it (see :attr:`computed_path_hash`) and every non-zero line in that
+        list needs its full cover path — the APK's ``getHashLineNew()`` check.
+        Values ``<= 1`` mean the device has no route.
+        """
+        if path_hash <= 1 or self.computed_path_hash != path_hash:
+            return False
+        return all(self.has_mow_path_for_hash(h) for h in self.line_root_hashlist if h)
+
+    def prune_incomplete_mow_paths(self) -> None:
+        """Drop transactions still missing frames, e.g. a request abandoned for a retry."""
+        for transaction_id in self.find_missing_mow_path_frames():
+            self.current_mow_path.pop(transaction_id, None)
 
     def invalidate_breakpoint_line(self, ub_path_hash: int) -> bool:
         """Sync ``self.line`` to the device's active breakpoint hash; return True if a fetch is needed.

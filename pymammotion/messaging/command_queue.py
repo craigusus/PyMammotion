@@ -284,11 +284,14 @@ class DeviceCommandQueue:
                     raise
                 except Exception as exc:
                     saga_exception = exc
-                    # GatewayTimeoutException and DeviceOfflineException are
-                    # expected operational errors handled by the _process retry
-                    # loop — logging them here as "unhandled" is misleading noise.
+                    # GatewayTimeoutException, DeviceOfflineException and SagaFailedError
+                    # are expected operational errors already logged (at WARNING) by the
+                    # _process retry loop / on_critical_error path — logging them here as
+                    # "unhandled" is misleading noise and duplicates that WARNING with a
+                    # full ERROR-level traceback for something that isn't a real bug.
                     if not isinstance(
-                        exc, (GatewayTimeoutException, DeviceOfflineException, NoTransportAvailableError)
+                        exc,
+                        (GatewayTimeoutException, DeviceOfflineException, NoTransportAvailableError, SagaFailedError),
                     ):
                         _logger.exception("Saga '%s' raised an unhandled exception", saga.name)
                     raise
@@ -309,6 +312,20 @@ class DeviceCommandQueue:
 
         await self.enqueue(_run, priority=Priority.EXCLUSIVE)
 
+    def _is_expired(self, item: _QueueItem) -> bool:
+        """Report, and log, whether a queued command has outlived ``_COMMAND_TTL`` undispatched.
+
+        EXCLUSIVE sagas are exempt: a queued map/plan sync routinely waits out a
+        multi-minute saga ahead of it, and dropping it means on_complete never fires.
+        """
+        if item.priority <= Priority.EXCLUSIVE:
+            return False
+        age = time.monotonic() - item.enqueued_at
+        if age <= _COMMAND_TTL:
+            return False
+        _logger.debug("DeviceCommandQueue[%s]: command expired after %.0fs — dropping", self._device_name, age)
+        return True
+
     async def _process(self) -> None:
         """Queue processor loop — runs as an asyncio background task."""
         while self._running:
@@ -324,22 +341,9 @@ class DeviceCommandQueue:
                 if item.dedup_key is not None:
                     self._pending_dedup_keys.discard(item.dedup_key)
 
-                # Drop commands that have waited longer than _COMMAND_TTL without being
-                # dispatched.  Checked here — before any lock/gate waits — so stale
-                # commands don't execute after a long reconnect or saga pause.
-                # EXCLUSIVE sagas are exempt: a queued map/plan sync routinely waits
-                # out a multi-minute saga ahead of it, and silently dropping it means
-                # on_complete never fires and nothing upstream learns the sync
-                # didn't happen.
-                if item.priority > Priority.EXCLUSIVE:
-                    age = time.monotonic() - item.enqueued_at
-                    if age > _COMMAND_TTL:
-                        _logger.debug(
-                            "DeviceCommandQueue[%s]: command expired after %.0fs — dropping",
-                            self._device_name,
-                            age,
-                        )
-                        continue
+                # Checked before the waits too, so a stale item doesn't hold the processor at the gate.
+                if self._is_expired(item):
+                    continue
 
                 # Queued items yield to an active exclusive op
                 if item.priority > Priority.EXCLUSIVE:
@@ -354,6 +358,9 @@ class DeviceCommandQueue:
                 # MQTT subscription isn't active yet.  Nothing bypasses this gate:
                 # the priorities that used to (EMERGENCY) no longer reach the queue.
                 await self._transport_gate.wait()
+
+                if self._is_expired(item):
+                    continue
 
                 await execute_command(
                     item.work,
