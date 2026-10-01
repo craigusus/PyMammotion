@@ -409,7 +409,9 @@ class MammotionClient(CloudAuthMixin):
         session = self._get_session_for_handle(handle)
 
         async def _send(payload: bytes) -> None:
-            await self._send_with_auth_retry(lambda: handle.send_raw(payload, user_initiated=True), session)
+            await self._send_with_auth_retry(
+                lambda: handle.send_raw(payload, user_initiated=True), session, swallow_transport_errors=False
+            )
 
         await execute_command(
             lambda: handle.refresh_status(_send),
@@ -563,8 +565,9 @@ class MammotionClient(CloudAuthMixin):
         re-logins with a stored password — that would bypass the prompt and, during a
         server-side outage, fire a password grant per queued command.
 
-        Other transport errors are logged and dropped unless *swallow_transport_errors*
-        is False — a remote-drive frame must not look delivered when it was refused.
+        Other transport errors are logged and dropped when *swallow_transport_errors*.
+        Pass ``not priority.is_direct``: a send a person is waiting on must raise, or a
+        refusal such as ``TransportRateLimitedError`` reports a command that never left.
         """
         try:
             await send_fn()
@@ -2627,6 +2630,7 @@ class MammotionClient(CloudAuthMixin):
             await self._send_with_auth_retry(
                 lambda: handle.send_raw(command_bytes, prefer_ble=_prefer_ble, user_initiated=priority.is_direct),
                 _session,
+                swallow_transport_errors=not priority.is_direct,
             )
 
         if priority.is_direct:
@@ -2681,10 +2685,9 @@ class MammotionClient(CloudAuthMixin):
         Raises:
             KeyError:             if *name* is not a registered device.
             CommandTimeoutError:  if no response after retries.
-            TransportRateLimitedError: if the send is refused before it reaches the
-                network — a cloud 429 ban, or the self-imposed quota on a non-direct
-                priority.  This method never used the queue, so nothing absorbs it here
-                regardless of *priority*.
+            TransportRateLimitedError: on a direct *priority*, if the send is refused
+                before it reaches the network (a cloud 429 ban).  On any other priority
+                the refusal is logged and dropped, and surfaces as ``CommandTimeoutError``.
 
         """
         handle = self._device_registry.get_by_name(name, account_id)
@@ -2702,6 +2705,7 @@ class MammotionClient(CloudAuthMixin):
                     payload=command_bytes, prefer_ble=prefer_ble, user_initiated=priority.is_direct
                 ),
                 _session,
+                swallow_transport_errors=not priority.is_direct,
             )
 
         return await handle.broker.send_and_wait(
